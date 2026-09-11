@@ -2,15 +2,16 @@
 """
 Snoop — the only snoop you'll ever invite in.
 
-Audits your computer for privacy issues, analyses files for sensitive
-data, and tells you exactly how to fix what it finds.
+Single-file privacy auditor with CLI and web dashboard.
+Zero dependencies beyond the Python standard library (psutil optional).
 
 Usage:
-    python snoop.py                      # full scan of home dir
-    python snoop.py --scan system        # only system checks
-    python snoop.py --scan files --path ~/Documents
-    python snoop.py --output snoop.json
-    python snoop.py --quiet
+    python snoop.py                          # one-shot scan, print report
+    python snoop.py --scan system            # only system checks
+    python snoop.py --output snoop.json      # save report
+    python snoop.py --dashboard              # launch web dashboard
+    python snoop.py --dashboard --port 9000  # custom port
+    python snoop.py --schedule-every 6h      # headless recurring scans
 
 License: MIT
 """
@@ -23,9 +24,13 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime
+import webbrowser
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 # ───────────────────────────── Optional psutil ─────────────────────────────
 try:
@@ -38,8 +43,11 @@ IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 TAGLINE = "The only snoop you'll ever invite in."
+SNOOP_HOME = Path.home() / ".snoop"
+HISTORY_DIR = SNOOP_HOME / "history"
+CONFIG_FILE = SNOOP_HOME / "config.json"
 
 
 # ───────────────────────────── Color helpers ─────────────────────────────
@@ -82,7 +90,6 @@ def header(title, quiet=False):
 
 # ───────────────────────────── Shell helpers ─────────────────────────────
 def run(cmd, shell=False, timeout=15):
-    """Run a command safely. Always returns (stdout, stderr, code)."""
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=True,
@@ -112,14 +119,6 @@ def read_text(path, max_bytes=2_000_000):
             return f.read(max_bytes)
     except (OSError, IOError):
         return None
-
-
-def human_size(n):
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}PB"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -427,7 +426,7 @@ SECRET_PATTERNS = {
 SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", "venv", ".venv",
     "env", ".cache", "Library", ".Trash", "$RECYCLE.BIN",
-    "System Volume Information", "AppData",
+    "System Volume Information", "AppData", ".snoop",
 }
 
 SKIP_EXTENSIONS = {
@@ -605,12 +604,7 @@ def scan_browser(quiet=False):
     for browser in findings["browsers"]:
         name = browser["name"]
         log(f"  [+] {name} found at {browser['path']}", C.GREEN, quiet)
-
-        if name == "Firefox":
-            issues = _check_firefox(browser["path"])
-        else:
-            issues = _check_chromium(browser["path"])
-
+        issues = _check_firefox(browser["path"]) if name == "Firefox" else _check_chromium(browser["path"])
         for issue in issues:
             findings["issues"].append({"browser": name, **issue})
 
@@ -630,7 +624,6 @@ def _check_chromium(root):
             continue
 
         profile = prefs_file.parent.name
-
         metrics = prefs.get("metrics", {})
         if isinstance(metrics, dict) and metrics.get("reporting_enabled"):
             issues.append({"profile": profile, "title": "usage statistics enabled"})
@@ -648,7 +641,6 @@ def _check_chromium(root):
                 issues.append({"profile": profile, "title": "camera allowed by default"})
             if content.get("media_stream_mic") == 1:
                 issues.append({"profile": profile, "title": "microphone allowed by default"})
-
     return issues
 
 
@@ -670,12 +662,11 @@ def _check_firefox(root):
             issues.append({"profile": profile, "title": "data upload enabled"})
         if pref("network.trr.mode") in (None, "0", "5"):
             issues.append({"profile": profile, "title": "DoH off"})
-
     return issues
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ADVICE ENGINE
+# ADVICE + SCORING
 # ══════════════════════════════════════════════════════════════════════════
 
 def build_advice(system, files, browser):
@@ -767,38 +758,8 @@ def build_advice(system, files, browser):
     return {"severity": severity, "advice": advice}
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# REPORTING
-# ══════════════════════════════════════════════════════════════════════════
-
-def print_advice(advice_data, quiet=False):
-    header("ADVICE", quiet)
-
-    sev = advice_data.get("severity", [])
-    if sev:
-        log("  Priority findings:", C.BOLD + C.RED, quiet)
-        for level, text in sev:
-            color = {"HIGH": C.RED, "MEDIUM": C.YELLOW, "LOW": C.BLUE}.get(level, C.WHITE)
-            log(f"    [{level}] {text}", color, quiet)
-        print()
-
-    log("  Recommended actions:", C.BOLD + C.CYAN, quiet)
-    for i, tip in enumerate(advice_data.get("advice", []), 1):
-        log(f"    {i:>2}. {tip}", C.CYAN, quiet)
-
-
-def save_report(report, path):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, default=str)
-        log(f"\n[+] Report saved to {path}", C.GREEN)
-    except OSError as e:
-        log(f"\n[!] Could not write report: {e}", C.RED)
-
-
 def compute_score(system, files):
     score = 100
-
     if system:
         checks = system.get("checks", {})
         if checks.get("firewall", {}).get("enabled") is False:
@@ -809,13 +770,11 @@ def compute_score(system, files):
             score -= 10
         risky = check_risky_ports(system.get("open_ports", []))
         score -= min(20, len(risky) * 5)
-
     if files:
         score -= min(15, len(files.get("with_secrets", [])) * 3)
         score -= min(10, len(files.get("with_pii", [])) * 2)
         score -= min(10, len(files.get("sensitive_files", [])))
         score -= min(5, len(files.get("world_writable", [])) * 2)
-
     return max(0, score)
 
 
@@ -825,6 +784,1253 @@ def grade(score):
     if score >= 70: return "C"
     if score >= 60: return "D"
     return "F"
+
+
+def extract_threats(system, files, browser, advice_data):
+    """Flatten findings into a list of threat objects for the dashboard."""
+    threats = []
+
+    if system:
+        checks = system.get("checks", {})
+        fw = checks.get("firewall", {})
+        if fw.get("enabled") is False:
+            threats.append({
+                "category": "system", "severity": "high",
+                "title": "Firewall disabled",
+                "detail": fw.get("details", ""),
+            })
+        enc = checks.get("disk_encryption", {})
+        if enc.get("encrypted") is False:
+            threats.append({
+                "category": "system", "severity": "critical",
+                "title": "Disk encryption off",
+                "detail": enc.get("details", ""),
+            })
+        auto = checks.get("auto_login", {})
+        if auto.get("enabled"):
+            threats.append({
+                "category": "system", "severity": "high",
+                "title": "Auto-login enabled",
+                "detail": auto.get("details", ""),
+            })
+        guest = checks.get("guest_account", {})
+        if guest.get("enabled"):
+            threats.append({
+                "category": "system", "severity": "medium",
+                "title": "Guest account enabled",
+                "detail": guest.get("details", ""),
+            })
+        for p in check_risky_ports(system.get("open_ports", [])):
+            threats.append({
+                "category": "network", "severity": "high",
+                "title": f"Risky port {p['port']} exposed",
+                "detail": f"{p['address']}:{p['port']} — {RISKY_PORTS.get(p['port'], '')}",
+            })
+
+    if files:
+        for entry in files.get("with_secrets", []):
+            types = ", ".join(entry["types"].keys())
+            threats.append({
+                "category": "files", "severity": "high",
+                "title": f"Secrets in {Path(entry['path']).name}",
+                "detail": f"{types} — {entry['path']}",
+            })
+        for entry in files.get("with_pii", []):
+            types = ", ".join(entry["types"].keys())
+            threats.append({
+                "category": "files", "severity": "medium",
+                "title": f"PII in {Path(entry['path']).name}",
+                "detail": f"{types} — {entry['path']}",
+            })
+        for entry in files.get("world_writable", [])[:20]:
+            threats.append({
+                "category": "files", "severity": "medium",
+                "title": "World-writable file",
+                "detail": entry,
+            })
+        for entry in files.get("sensitive_files", [])[:20]:
+            threats.append({
+                "category": "files", "severity": "low",
+                "title": f"Sensitive file: {entry['type']}",
+                "detail": entry["path"],
+            })
+
+    if browser:
+        for issue in browser.get("issues", []):
+            threats.append({
+                "category": "browser", "severity": "low",
+                "title": f"{issue['browser']}: {issue['title']}",
+                "detail": f"profile {issue.get('profile', 'default')}",
+            })
+
+    return threats
+
+
+def severity_counts(threats):
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for t in threats:
+        counts[t["severity"]] = counts.get(t["severity"], 0) + 1
+    return counts
+
+
+def run_full_scan(scan_type="all", path=None, quiet=False, max_files=50000):
+    """Run scans and return a complete report dict."""
+    if path is None:
+        path = os.path.expanduser("~")
+
+    report = {
+        "tool": "snoop",
+        "version": VERSION,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "platform": platform.platform(),
+        "scan_type": scan_type,
+    }
+
+    system_findings = {}
+    file_findings = {}
+    browser_findings = {}
+
+    if scan_type in ("all", "system"):
+        system_findings = scan_system(quiet=quiet)
+        report["system"] = system_findings
+    if scan_type in ("all", "files"):
+        if not quiet:
+            header("FILE SCAN", quiet)
+        file_findings = scan_directory(path, quiet=quiet, max_files=max_files)
+        report["files"] = file_findings
+    if scan_type in ("all", "browser"):
+        if not quiet:
+            header("BROWSER SCAN", quiet)
+        browser_findings = scan_browser(quiet=quiet)
+        report["browser"] = browser_findings
+
+    advice_data = build_advice(system_findings, file_findings, browser_findings)
+    report["advice"] = advice_data
+
+    score = compute_score(system_findings, file_findings)
+    report["score"] = score
+    report["grade"] = grade(score)
+
+    threats = extract_threats(system_findings, file_findings, browser_findings, advice_data)
+    report["threats"] = threats
+    report["severity_counts"] = severity_counts(threats)
+
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# HISTORY / STORAGE
+# ══════════════════════════════════════════════════════════════════════════
+
+_STORAGE_LOCK = threading.Lock()
+
+
+def ensure_dirs():
+    SNOOP_HOME.mkdir(exist_ok=True)
+    HISTORY_DIR.mkdir(exist_ok=True)
+
+
+def _report_id(ts=None):
+    ts = ts or datetime.now()
+    return ts.strftime("%Y%m%d-%H%M%S")
+
+
+def save_history(report):
+    ensure_dirs()
+    rid = _report_id()
+    report["id"] = rid
+    path = HISTORY_DIR / f"{rid}.json"
+    with _STORAGE_LOCK:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str)
+    return rid
+
+
+def list_history(limit=None):
+    """Return summaries, newest first."""
+    ensure_dirs()
+    files = sorted(HISTORY_DIR.glob("*.json"), reverse=True)
+    if limit:
+        files = files[:limit]
+
+    summaries = []
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            summaries.append({
+                "id": data.get("id", fp.stem),
+                "timestamp": data.get("timestamp", ""),
+                "score": data.get("score", 0),
+                "grade": data.get("grade", "?"),
+                "severity_counts": data.get("severity_counts", {}),
+                "scan_type": data.get("scan_type", "all"),
+            })
+        except (OSError, json.JSONDecodeError):
+            continue
+    return summaries
+
+
+def load_report(report_id):
+    path = HISTORY_DIR / f"{report_id}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def delete_report(report_id):
+    path = HISTORY_DIR / f"{report_id}.json"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+DEFAULT_CONFIG = {
+    "schedule": {
+        "enabled": False,
+        "interval_hours": 24,
+        "scan_type": "all",
+        "path": "~",
+        "max_files": 50000,
+        "last_run": None,
+        "next_run": None,
+    }
+}
+
+
+def load_config():
+    ensure_dirs()
+    if not CONFIG_FILE.exists():
+        save_config(DEFAULT_CONFIG)
+        return dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        # Merge with defaults
+        for k, v in DEFAULT_CONFIG.items():
+            cfg.setdefault(k, v)
+        return cfg
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    ensure_dirs()
+    with _STORAGE_LOCK:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SCHEDULER
+# ══════════════════════════════════════════════════════════════════════════
+
+class Scheduler:
+    """Background scheduler that runs scans periodically."""
+
+    def __init__(self, on_scan_complete=None):
+        self._stop = threading.Event()
+        self._thread = None
+        self._scan_lock = threading.Lock()
+        self._scanning = False
+        self._on_complete = on_scan_complete
+        self._last_error = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def is_scanning(self):
+        return self._scanning
+
+    def last_error(self):
+        return self._last_error
+
+    def run_now(self, scan_type="all", path=None, max_files=50000):
+        """Trigger an immediate scan in a background thread."""
+        if not self._scan_lock.acquire(blocking=False):
+            return False
+        try:
+            self._scanning = True
+            threading.Thread(
+                target=self._do_scan,
+                args=(scan_type, path, max_files),
+                daemon=True,
+            ).start()
+            return True
+        except Exception:
+            self._scan_lock.release()
+            self._scanning = False
+            raise
+
+    def _do_scan(self, scan_type, path, max_files):
+        try:
+            report = run_full_scan(
+                scan_type=scan_type,
+                path=path,
+                quiet=True,
+                max_files=max_files,
+            )
+            rid = save_history(report)
+            cfg = load_config()
+            cfg["schedule"]["last_run"] = report["timestamp"]
+            if cfg["schedule"].get("enabled"):
+                interval = cfg["schedule"].get("interval_hours", 24)
+                next_run = datetime.now() + timedelta(hours=interval)
+                cfg["schedule"]["next_run"] = next_run.isoformat(timespec="seconds")
+            save_config(cfg)
+            self._last_error = None
+            if self._on_complete:
+                try:
+                    self._on_complete(rid, report)
+                except Exception:
+                    pass
+        except Exception as e:
+            self._last_error = str(e)
+        finally:
+            self._scanning = False
+            self._scan_lock.release()
+
+    def _loop(self):
+        # Give the server a moment to start up
+        time.sleep(2)
+        while not self._stop.is_set():
+            try:
+                cfg = load_config()
+                sched = cfg.get("schedule", {})
+                if sched.get("enabled"):
+                    next_run = sched.get("next_run")
+                    due = False
+                    if not next_run:
+                        due = True
+                    else:
+                        try:
+                            due = datetime.fromisoformat(next_run) <= datetime.now()
+                        except ValueError:
+                            due = True
+
+                    if due and not self._scanning:
+                        self.run_now(
+                            scan_type=sched.get("scan_type", "all"),
+                            path=expand(sched.get("path", "~")),
+                            max_files=sched.get("max_files", 50000),
+                        )
+            except Exception:
+                pass
+            self._stop.wait(30)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# DASHBOARD (HTTP server + embedded HTML/JS)
+# ══════════════════════════════════════════════════════════════════════════
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snoop Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --border: #30363d;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #ff79c6;
+    --green: #4ade80;
+    --yellow: #facc15;
+    --orange: #fb923c;
+    --red: #ef4444;
+    --blue: #60a5fa;
+    --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  header {
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    background: var(--bg2);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+  }
+  header h1 .dot { color: var(--accent); }
+  header .tagline {
+    color: var(--muted);
+    font-size: 12px;
+    margin-left: 4px;
+  }
+  header .spacer { flex: 1; }
+  header .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .pulse {
+    display: inline-block;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.6);
+    animation: pulse 2s infinite;
+  }
+  .pulse.scanning {
+    background: var(--yellow);
+    box-shadow: 0 0 0 0 rgba(250, 204, 21, 0.6);
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5); }
+    70%  { box-shadow: 0 0 0 10px rgba(74, 222, 128, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
+  }
+
+  main {
+    padding: 22px 28px 60px;
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    margin: 0 0 14px;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .card .body { display: block; }
+
+  .gauge-wrap { display: flex; align-items: center; gap: 22px; }
+  .gauge-wrap svg { flex-shrink: 0; }
+  .gauge-meta .big {
+    font-size: 42px;
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: -1px;
+  }
+  .gauge-meta .grade {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 18px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .legend .swatch {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-row .label { color: var(--muted); }
+  .stat-row .value { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .chart-svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .chip {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .chip.critical { background: rgba(239, 68, 68, 0.15);  color: var(--red); }
+  .chip.high     { background: rgba(251, 146, 60, 0.15); color: var(--orange); }
+  .chip.medium   { background: rgba(250, 204, 21, 0.15); color: var(--yellow); }
+  .chip.low      { background: rgba(96, 165, 250, 0.15); color: var(--blue); }
+  .chip.pass     { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .muted { color: var(--muted); }
+
+  .threats-scroll { max-height: 420px; overflow-y: auto; margin: -4px -8px; padding: 4px 8px; }
+
+  form.schedule {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    align-items: end;
+  }
+  form.schedule label {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  form.schedule input[type=text],
+  form.schedule input[type=number],
+  form.schedule select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 7px 9px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  form.schedule input[type=checkbox] {
+    accent-color: var(--accent);
+    width: 16px; height: 16px;
+  }
+  .check-label {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center;
+    gap: 8px;
+    color: var(--fg) !important;
+    font-size: 13px !important;
+  }
+
+  button {
+    background: var(--accent);
+    color: #0d1117;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: filter 0.15s;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--border);
+  }
+  button.secondary:hover { background: var(--bg); }
+
+  .actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 14px;
+  }
+
+  .banner {
+    padding: 12px 16px;
+    border-radius: 8px;
+    background: rgba(255, 121, 198, 0.08);
+    border: 1px solid rgba(255, 121, 198, 0.3);
+    color: var(--fg);
+    font-size: 13px;
+    margin-bottom: 16px;
+    display: none;
+  }
+  .banner.show { display: block; }
+  .banner.error {
+    background: rgba(239, 68, 68, 0.08);
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+
+  .empty {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 20px 0;
+    text-align: center;
+  }
+
+  @media (max-width: 640px) {
+    header { padding: 14px 16px; }
+    header .tagline { display: none; }
+    main { padding: 16px; }
+    .card { padding: 14px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔍 Snoop<span class="dot">.</span></h1>
+  <span class="tagline">__TAGLINE__</span>
+  <div class="spacer"></div>
+  <div class="status">
+    <span class="pulse" id="pulse"></span>
+    <span id="status-text">connecting…</span>
+  </div>
+</header>
+
+<main>
+  <div class="banner" id="banner"></div>
+
+  <div class="grid">
+    <div class="card" style="grid-column: span 1;">
+      <h2>Privacy Score</h2>
+      <div class="gauge-wrap">
+        <svg id="gauge" width="180" height="130" viewBox="0 0 180 130"></svg>
+        <div class="gauge-meta">
+          <div class="big" id="score-big">—</div>
+          <div class="grade" id="score-grade">no scans yet</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Severity Breakdown</h2>
+      <div class="body" id="severity-chart"></div>
+    </div>
+
+    <div class="card">
+      <h2>Categories</h2>
+      <div class="body" id="category-chart"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Score History</h2>
+    <svg id="history-chart" class="chart-svg" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
+  </div>
+
+  <div class="card">
+    <h2>Recent Threats</h2>
+    <div class="threats-scroll">
+      <table id="threats-table">
+        <thead>
+          <tr><th style="width:90px">Severity</th><th style="width:100px">Category</th><th>Threat</th><th class="muted">Detail</th></tr>
+        </thead>
+        <tbody id="threats-body">
+          <tr><td colspan="4" class="empty">No scans yet — run one to see threats.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Schedule</h2>
+    <form class="schedule" id="schedule-form">
+      <label class="check-label">
+        <input type="checkbox" id="sched-enabled">
+        Enabled
+      </label>
+      <label>
+        Every (hours)
+        <input type="number" id="sched-interval" min="1" max="720" value="24">
+      </label>
+      <label>
+        Scan
+        <select id="sched-scan">
+          <option value="all">All</option>
+          <option value="system">System</option>
+          <option value="files">Files</option>
+          <option value="browser">Browsers</option>
+        </select>
+      </label>
+      <label>
+        Path
+        <input type="text" id="sched-path" value="~">
+      </label>
+      <button type="submit">Save</button>
+    </form>
+    <div class="actions">
+      <button id="scan-now">Scan Now</button>
+      <button id="delete-all" class="secondary">Clear History</button>
+    </div>
+    <div class="muted mono" id="sched-info" style="margin-top:12px; font-size:12px;"></div>
+  </div>
+</main>
+
+<script>
+const SEVERITY_COLORS = {
+  critical: '#ef4444',
+  high:     '#fb923c',
+  medium:   '#facc15',
+  low:      '#60a5fa',
+  pass:     '#4ade80',
+};
+const CATEGORY_COLORS = {
+  system:  '#ff79c6',
+  network: '#a78bfa',
+  files:   '#60a5fa',
+  browser: '#4ade80',
+};
+
+function el(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function showBanner(msg, isError) {
+  const b = el('banner');
+  b.textContent = msg;
+  b.className = 'banner show' + (isError ? ' error' : '');
+  setTimeout(() => { b.className = 'banner'; }, 4000);
+}
+
+// ─── Gauge ──────────────────────────────────────────────────────────
+function renderGauge(score) {
+  const svg = el('gauge');
+  const cx = 90, cy = 100, r = 70;
+  const startAngle = 180;
+  const endAngle = 0;
+  const totalAngle = 180;
+
+  function polar(cx, cy, r, deg) {
+    const rad = deg * Math.PI / 180;
+    return [cx + r * Math.cos(rad), cy - r * Math.sin(rad)];
+  }
+  function arcPath(cx, cy, r, a1, a2) {
+    const [x1, y1] = polar(cx, cy, r, a1);
+    const [x2, y2] = polar(cx, cy, r, a2);
+    const large = Math.abs(a2 - a1) > 180 ? 1 : 0;
+    const sweep = a2 < a1 ? 1 : 0;
+    return `M ${x1} ${y1} A ${r} ${r} 0 ${large} ${sweep} ${x2} ${y2}`;
+  }
+
+  const color = score >= 80 ? '#4ade80' : score >= 60 ? '#facc15' : '#ef4444';
+  const angle = startAngle + (score / 100) * (endAngle - startAngle);
+  const bg = `<path d="${arcPath(cx, cy, r, startAngle, endAngle)}" stroke="#30363d" stroke-width="12" fill="none" stroke-linecap="round"/>`;
+  const fg = score > 0
+    ? `<path d="${arcPath(cx, cy, r, startAngle, angle)}" stroke="${color}" stroke-width="12" fill="none" stroke-linecap="round"/>`
+    : '';
+
+  svg.innerHTML = bg + fg + `
+    <text x="${cx}" y="${cy - 8}" text-anchor="middle" fill="#e6edf3" font-size="26" font-weight="800">${score}</text>
+    <text x="${cx}" y="${cy + 10}" text-anchor="middle" fill="#8b949e" font-size="11">out of 100</text>
+  `;
+}
+
+// ─── Severity bar chart ────────────────────────────────────────────
+function renderSeverityChart(counts) {
+  const container = el('severity-chart');
+  const levels = ['critical', 'high', 'medium', 'low'];
+  const labels = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
+  const max = Math.max(1, ...levels.map(l => counts[l] || 0));
+
+  let html = '';
+  levels.forEach(l => {
+    const v = counts[l] || 0;
+    const pct = (v / max) * 100;
+    html += `
+      <div style="margin-bottom:10px;">
+        <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+          <span>${labels[l]}</span>
+          <span class="mono" style="color:${SEVERITY_COLORS[l]}">${v}</span>
+        </div>
+        <div style="height:8px; background:#0d1117; border-radius:4px; overflow:hidden;">
+          <div style="width:${pct}%; height:100%; background:${SEVERITY_COLORS[l]}; transition:width 0.4s;"></div>
+        </div>
+      </div>`;
+  });
+  container.innerHTML = html;
+}
+
+// ─── Category distribution ─────────────────────────────────────────
+function renderCategoryChart(threats) {
+  const container = el('category-chart');
+  const counts = { system: 0, network: 0, files: 0, browser: 0 };
+  threats.forEach(t => { counts[t.category] = (counts[t.category] || 0) + 1; });
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+
+  if (total === 0) {
+    container.innerHTML = '<div class="empty">No threats detected.</div>';
+    return;
+  }
+
+  let html = '<div style="display:flex; flex-direction:column; gap:10px;">';
+  Object.entries(counts).forEach(([cat, n]) => {
+    if (n === 0) return;
+    const pct = Math.round((n / total) * 100);
+    html += `
+      <div style="display:flex; align-items:center; gap:10px; font-size:13px;">
+        <span class="swatch" style="background:${CATEGORY_COLORS[cat] || '#888'}; width:10px; height:10px; border-radius:2px; display:inline-block;"></span>
+        <span style="width:70px; text-transform:capitalize;">${cat}</span>
+        <span class="mono muted" style="width:40px; text-align:right;">${n}</span>
+        <div style="flex:1; height:6px; background:#0d1117; border-radius:3px; overflow:hidden;">
+          <div style="width:${pct}%; height:100%; background:${CATEGORY_COLORS[cat] || '#888'};"></div>
+        </div>
+        <span class="muted mono" style="width:40px; text-align:right; font-size:11px;">${pct}%</span>
+      </div>`;
+  });
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+// ─── History line chart ────────────────────────────────────────────
+function renderHistoryChart(history) {
+  const svg = el('history-chart');
+  const W = 800, H = 220;
+  const pad = { l: 44, r: 20, t: 16, b: 34 };
+  const chartW = W - pad.l - pad.r;
+  const chartH = H - pad.t - pad.b;
+
+  // history newest first → reverse for chronological
+  const data = history.slice().reverse();
+
+  if (data.length === 0) {
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" fill="#8b949e" font-size="13" text-anchor="middle">No scans yet</text>`;
+    return;
+  }
+
+  const xs = i => pad.l + (data.length === 1 ? chartW / 2 : (i / (data.length - 1)) * chartW);
+  const ys = s => pad.t + (1 - s / 100) * chartH;
+
+  let grid = '';
+  for (let s = 0; s <= 100; s += 25) {
+    const y = ys(s);
+    grid += `<line x1="${pad.l}" y1="${y}" x2="${W - pad.r}" y2="${y}" stroke="#21262d" stroke-width="1"/>`;
+    grid += `<text x="${pad.l - 10}" y="${y + 4}" fill="#8b949e" font-size="11" text-anchor="end">${s}</text>`;
+  }
+
+  const points = data.map((d, i) => `${xs(i)},${ys(d.score)}`).join(' ');
+
+  // area fill
+  const areaPath = `M ${xs(0)} ${ys(data[0].score)} `
+    + data.map((d, i) => `L ${xs(i)} ${ys(d.score)}`).join(' ')
+    + ` L ${xs(data.length - 1)} ${H - pad.b} L ${xs(0)} ${H - pad.b} Z`;
+
+  let dots = '';
+  data.forEach((d, i) => {
+    const cx = xs(i), cy = ys(d.score);
+    const color = d.score >= 80 ? '#4ade80' : d.score >= 60 ? '#facc15' : '#ef4444';
+    dots += `<circle cx="${cx}" cy="${cy}" r="3.5" fill="${color}" stroke="#161b22" stroke-width="1.5"/>`;
+  });
+
+  // x-axis labels (sparse if many points)
+  let xlabels = '';
+  const step = Math.max(1, Math.ceil(data.length / 8));
+  data.forEach((d, i) => {
+    if (i % step !== 0 && i !== data.length - 1) return;
+    const ts = d.timestamp ? d.timestamp.replace('T', ' ').slice(5, 16) : '';
+    xlabels += `<text x="${xs(i)}" y="${H - pad.b + 18}" fill="#8b949e" font-size="10" text-anchor="middle">${esc(ts)}</text>`;
+  });
+
+  svg.innerHTML = `
+    <defs>
+      <linearGradient id="area-grad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#ff79c6" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="#ff79c6" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    ${grid}
+    <path d="${areaPath}" fill="url(#area-grad)"/>
+    <polyline points="${points}" stroke="#ff79c6" stroke-width="2" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+    ${dots}
+    ${xlabels}
+  `;
+}
+
+// ─── Threats table ─────────────────────────────────────────────────
+function renderThreats(threats) {
+  const body = el('threats-body');
+  if (!threats || threats.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" class="empty">No threats detected. Nice.</td></tr>';
+    return;
+  }
+  const order = { critical: 0, high: 1, medium: 2, low: 3 };
+  const sorted = threats.slice().sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
+
+  body.innerHTML = sorted.map(t => `
+    <tr>
+      <td><span class="chip ${esc(t.severity)}">${esc(t.severity)}</span></td>
+      <td class="muted" style="text-transform:capitalize;">${esc(t.category)}</td>
+      <td>${esc(t.title)}</td>
+      <td class="muted mono" style="max-width:380px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(t.detail)}</td>
+    </tr>
+  `).join('');
+}
+
+// ─── API helpers ───────────────────────────────────────────────────
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+async function refresh() {
+  try {
+    const status = await api('/api/status');
+    el('status-text').textContent = status.scanning
+      ? 'scanning…'
+      : (status.last_scan ? `last scan ${status.last_scan.timestamp.replace('T',' ').slice(0,16)}` : 'idle');
+    el('pulse').className = 'pulse' + (status.scanning ? ' scanning' : '');
+
+    // Schedule form
+    const sched = status.schedule || {};
+    if (document.activeElement !== el('sched-enabled'))
+      el('sched-enabled').checked = !!sched.enabled;
+    if (document.activeElement !== el('sched-interval'))
+      el('sched-interval').value = sched.interval_hours || 24;
+    if (document.activeElement !== el('sched-scan'))
+      el('sched-scan').value = sched.scan_type || 'all';
+    if (document.activeElement !== el('sched-path'))
+      el('sched-path').value = sched.path || '~';
+
+    el('sched-info').textContent = sched.enabled
+      ? `Next run: ${sched.next_run ? sched.next_run.replace('T',' ').slice(0,16) : 'pending'}`
+      : 'Scheduler is off.';
+
+    // Latest report
+    if (status.last_scan && status.last_scan.id) {
+      const report = await api('/api/report/' + encodeURIComponent(status.last_scan.id));
+      renderGauge(report.score);
+      el('score-big').textContent = report.score;
+      el('score-grade').textContent = `grade ${report.grade}`;
+      renderSeverityChart(report.severity_counts || {});
+      renderCategoryChart(report.threats || []);
+      renderThreats(report.threats || []);
+    } else {
+      renderGauge(0);
+      el('score-big').textContent = '—';
+      el('score-grade').textContent = 'no scans yet';
+      renderSeverityChart({});
+      renderCategoryChart([]);
+      renderThreats([]);
+    }
+
+    // History chart
+    const hist = await api('/api/history?limit=60');
+    renderHistoryChart(hist);
+
+  } catch (e) {
+    el('status-text').textContent = 'disconnected';
+    el('pulse').className = 'pulse';
+  }
+}
+
+// ─── Event wiring ──────────────────────────────────────────────────
+el('scan-now').addEventListener('click', async () => {
+  el('scan-now').disabled = true;
+  try {
+    await api('/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    showBanner('Scan started — results will appear shortly.');
+    setTimeout(refresh, 1500);
+  } catch (e) {
+    showBanner('Failed to start scan: ' + e.message, true);
+  } finally {
+    el('scan-now').disabled = false;
+  }
+});
+
+el('schedule-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const payload = {
+    enabled: el('sched-enabled').checked,
+    interval_hours: parseInt(el('sched-interval').value, 10) || 24,
+    scan_type: el('sched-scan').value,
+    path: el('sched-path').value || '~',
+  };
+  try {
+    await api('/api/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    showBanner('Schedule saved.');
+    refresh();
+  } catch (e) {
+    showBanner('Failed to save schedule: ' + e.message, true);
+  }
+});
+
+el('delete-all').addEventListener('click', async () => {
+  if (!confirm('Clear all scan history? This cannot be undone.')) return;
+  try {
+    await api('/api/history', { method: 'DELETE' });
+    showBanner('History cleared.');
+    refresh();
+  } catch (e) {
+    showBanner('Failed to clear: ' + e.message, true);
+  }
+});
+
+// Auto-refresh
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the dashboard and API."""
+
+    scheduler = None  # set by serve_dashboard
+
+    def log_message(self, format, *args):
+        # Silence default request logging; comment this out for debug
+        pass
+
+    def _send(self, status, body, content_type="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, default=str).encode("utf-8")
+        elif isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length == 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        try:
+            if path == "/" or path == "/index.html":
+                html = DASHBOARD_HTML.replace("__TAGLINE__", TAGLINE).replace("__VERSION__", VERSION)
+                return self._send(200, html, "text/html; charset=utf-8")
+
+            if path == "/api/status":
+                history = list_history(limit=1)
+                last = history[0] if history else None
+                cfg = load_config()
+                return self._send(200, {
+                    "version": VERSION,
+                    "scanning": self.scheduler.is_scanning() if self.scheduler else False,
+                    "last_error": self.scheduler.last_error() if self.scheduler else None,
+                    "last_scan": last,
+                    "schedule": cfg.get("schedule", {}),
+                    "history_count": len(list_history()),
+                })
+
+            if path == "/api/history":
+                limit = int(query.get("limit", ["60"])[0])
+                return self._send(200, list_history(limit=limit))
+
+            if path == "/api/latest":
+                history = list_history(limit=1)
+                if not history:
+                    return self._send(404, {"error": "no reports"})
+                report = load_report(history[0]["id"])
+                return self._send(200, report or {})
+
+            if path.startswith("/api/report/"):
+                rid = path[len("/api/report/"):]
+                report = load_report(rid)
+                if report is None:
+                    return self._send(404, {"error": "not found"})
+                return self._send(200, report)
+
+            if path == "/api/schedule":
+                cfg = load_config()
+                return self._send(200, cfg.get("schedule", {}))
+
+            return self._send(404, {"error": "not found"})
+
+        except Exception as e:
+            return self._send(500, {"error": str(e)})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        try:
+            if path == "/api/scan":
+                if not self.scheduler:
+                    return self._send(500, {"error": "scheduler not running"})
+                body = self._read_json()
+                scan_type = body.get("scan_type", "all")
+                scan_path = body.get("path") or None
+                max_files = int(body.get("max_files", 50000))
+                ok = self.scheduler.run_now(scan_type=scan_type, path=scan_path, max_files=max_files)
+                return self._send(200, {"ok": ok, "message": "scan started" if ok else "scan already running"})
+
+            if path == "/api/schedule":
+                body = self._read_json()
+                cfg = load_config()
+                sched = cfg.setdefault("schedule", {})
+                sched["enabled"] = bool(body.get("enabled", False))
+                sched["interval_hours"] = int(body.get("interval_hours", 24))
+                sched["scan_type"] = body.get("scan_type", "all")
+                sched["path"] = body.get("path", "~")
+                sched["max_files"] = int(body.get("max_files", 50000))
+                if sched["enabled"]:
+                    next_run = datetime.now() + timedelta(hours=sched["interval_hours"])
+                    sched["next_run"] = next_run.isoformat(timespec="seconds")
+                else:
+                    sched["next_run"] = None
+                save_config(cfg)
+                return self._send(200, {"ok": True, "schedule": sched})
+
+            return self._send(404, {"error": "not found"})
+
+        except Exception as e:
+            return self._send(500, {"error": str(e)})
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        try:
+            if path == "/api/history":
+                ensure_dirs()
+                count = 0
+                for fp in HISTORY_DIR.glob("*.json"):
+                    try:
+                        fp.unlink()
+                        count += 1
+                    except OSError:
+                        pass
+                return self._send(200, {"ok": True, "deleted": count})
+
+            if path.startswith("/api/report/"):
+                rid = path[len("/api/report/"):]
+                ok = delete_report(rid)
+                return self._send(200 if ok else 404, {"ok": ok})
+
+            return self._send(404, {"error": "not found"})
+
+        except Exception as e:
+            return self._send(500, {"error": str(e)})
+
+
+def find_free_port(start=8765, end=8775):
+    import socket
+    for p in range(start, end + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    return start
+
+
+def serve_dashboard(port=8765, open_browser=True):
+    """Start the dashboard server and scheduler. Blocks until Ctrl+C."""
+    ensure_dirs()
+    load_config()  # ensure config exists
+
+    if port == 0:
+        port = find_free_port()
+
+    scheduler = Scheduler()
+    scheduler.start()
+
+    handler = type("Handler", (DashboardHandler,), {"scheduler": scheduler})
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    url = f"http://127.0.0.1:{port}/"
+
+    print()
+    print(c("╔" + "═" * 58 + "╗", C.MAGENTA))
+    print(c(f"║  Snoop Dashboard v{VERSION}".ljust(59) + "║", C.MAGENTA + C.BOLD))
+    print(c(f"║  {TAGLINE}".ljust(59) + "║", C.MAGENTA))
+    print(c("╚" + "═" * 58 + "╝", C.MAGENTA))
+    print()
+    print(c(f"  → Dashboard:  {url}", C.CYAN + C.BOLD))
+    print(c(f"  → History:    {HISTORY_DIR}", C.BLUE))
+    print(c(f"  → Config:     {CONFIG_FILE}", C.BLUE))
+    print()
+    print(c("  Press Ctrl+C to stop.", C.DIM))
+    print()
+
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print(c("\n[*] Shutting down…", C.YELLOW))
+    finally:
+        scheduler.stop()
+        server.shutdown()
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -849,8 +2055,19 @@ def parse_args(argv=None):
                    help="Disable ANSI colors")
     p.add_argument("--max-files", type=int, default=50000,
                    help="Cap on files scanned (default 50000)")
-    p.add_argument("--version", action="version",
-                   version=f"Snoop v{VERSION}")
+    p.add_argument("--no-history", action="store_true",
+                   help="Don't save this scan to ~/.snoop/history")
+    p.add_argument("--history", action="store_true",
+                   help="Show recent scan history and exit")
+    p.add_argument("--dashboard", action="store_true",
+                   help="Launch the web dashboard")
+    p.add_argument("--port", type=int, default=8765,
+                   help="Dashboard port (default 8765, use 0 for auto)")
+    p.add_argument("--no-browser", action="store_true",
+                   help="Don't auto-open the browser when starting the dashboard")
+    p.add_argument("--schedule-every", metavar="Nh",
+                   help="Headless mode: run scans every N hours (e.g. 6h, 24h)")
+    p.add_argument("--version", action="version", version=f"Snoop v{VERSION}")
     return p.parse_args(argv)
 
 
@@ -863,6 +2080,86 @@ def print_banner():
     print(c("╚" + "═" * 58 + "╝", C.MAGENTA))
 
 
+def print_advice(advice_data, quiet=False):
+    header("ADVICE", quiet)
+
+    sev = advice_data.get("severity", [])
+    if sev:
+        log("  Priority findings:", C.BOLD + C.RED, quiet)
+        for level, text in sev:
+            color = {"HIGH": C.RED, "MEDIUM": C.YELLOW, "LOW": C.BLUE}.get(level, C.WHITE)
+            log(f"    [{level}] {text}", color, quiet)
+        print()
+
+    log("  Recommended actions:", C.BOLD + C.CYAN, quiet)
+    for i, tip in enumerate(advice_data.get("advice", []), 1):
+        log(f"    {i:>2}. {tip}", C.CYAN, quiet)
+
+
+def show_history():
+    history = list_history(limit=20)
+    if not history:
+        print(c("No scan history yet. Run a scan first.", C.YELLOW))
+        return 0
+
+    print()
+    print(c(f"{'ID':<20} {'When':<20} {'Score':<8} {'Grade':<6} Threats", C.BOLD))
+    print(c("─" * 70, C.DIM))
+    for h in history:
+        counts = h.get("severity_counts", {})
+        total = sum(counts.values()) if counts else 0
+        ts = h.get("timestamp", "").replace("T", " ")[:16]
+        color = C.GREEN if h["score"] >= 80 else C.YELLOW if h["score"] >= 60 else C.RED
+        print(c(f"{h['id']:<20} {ts:<20} {h['score']:<8} {h['grade']:<6} {total}", color))
+    print()
+    print(c(f"Full reports in: {HISTORY_DIR}", C.DIM))
+    print()
+    return 0
+
+
+def parse_interval(s):
+    """Parse '6h', '24h', '30m', '2d' → hours as float."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([hmd]?)\s*$", s.lower())
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid interval: {s}")
+    n = float(m.group(1))
+    unit = m.group(2) or "h"
+    if unit == "m":
+        return n / 60
+    if unit == "d":
+        return n * 24
+    return n
+
+
+def headless_schedule(interval_hours, scan_type, path, max_files):
+    """Run scans on a fixed interval, headless (no HTTP server)."""
+    print_banner()
+    print(c(f"  Headless mode · scanning every {interval_hours}h", C.CYAN))
+    print(c(f"  Reports saved to {HISTORY_DIR}", C.BLUE))
+    print(c("  Press Ctrl+C to stop.\n", C.DIM))
+
+    while True:
+        start = datetime.now()
+        print(c(f"[{start:%Y-%m-%d %H:%M:%S}] Starting scheduled scan…", C.MAGENTA))
+        try:
+            report = run_full_scan(scan_type=scan_type, path=path, quiet=True, max_files=max_files)
+            rid = save_history(report)
+            threats = report.get("severity_counts", {})
+            total = sum(threats.values()) if threats else 0
+            color = C.GREEN if report["score"] >= 80 else C.YELLOW if report["score"] >= 60 else C.RED
+            print(c(f"  → {rid}  score={report['score']}  grade={report['grade']}  threats={total}", color))
+        except Exception as e:
+            print(c(f"  [!] Scan failed: {e}", C.RED))
+
+        next_run = start + timedelta(hours=interval_hours)
+        print(c(f"  Next scan at {next_run:%Y-%m-%d %H:%M:%S}\n", C.DIM))
+        try:
+            time.sleep(interval_hours * 3600)
+        except KeyboardInterrupt:
+            print(c("\n[*] Stopped.", C.YELLOW))
+            return 0
+
+
 def main(argv=None):
     global USE_COLOR
 
@@ -870,52 +2167,60 @@ def main(argv=None):
     if args.no_color or not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
         USE_COLOR = False
 
+    # Dashboard mode
+    if args.dashboard:
+        return serve_dashboard(port=args.port, open_browser=not args.no_browser)
+
+    # History viewer
+    if args.history:
+        return show_history()
+
+    # Headless scheduler
+    if args.schedule_every:
+        try:
+            interval = parse_interval(args.schedule_every)
+        except argparse.ArgumentTypeError as e:
+            print(c(f"[!] {e}", C.RED), file=sys.stderr)
+            return 2
+        return headless_schedule(interval, args.scan, args.path, args.max_files)
+
+    # Default: one-shot scan
     print_banner()
 
     if not HAS_PSUTIL:
         log("\n[i] psutil not installed — some checks will use fallbacks.", C.YELLOW)
         log("    Install for best results: pip install psutil", C.DIM)
 
-    report = {
-        "tool": "snoop",
-        "version": VERSION,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "platform": platform.platform(),
-    }
-
-    system_findings = {}
-    file_findings = {}
-    browser_findings = {}
-
-    if args.scan in ("all", "system"):
-        system_findings = scan_system(quiet=args.quiet)
-        report["system"] = system_findings
-
-    if args.scan in ("all", "files"):
-        header("FILE SCAN", args.quiet)
-        file_findings = scan_directory(args.path, quiet=args.quiet, max_files=args.max_files)
-        report["files"] = file_findings
-
-    if args.scan in ("all", "browser"):
-        header("BROWSER SCAN", args.quiet)
-        browser_findings = scan_browser(quiet=args.quiet)
-        report["browser"] = browser_findings
-
-    advice_data = build_advice(system_findings, file_findings, browser_findings)
-    report["advice"] = advice_data
-
-    score = compute_score(system_findings, file_findings)
-    report["score"] = score
-    report["grade"] = grade(score)
+    report = run_full_scan(
+        scan_type=args.scan,
+        path=args.path,
+        quiet=args.quiet,
+        max_files=args.max_files,
+    )
 
     header("SCORE", args.quiet)
-    score_color = C.GREEN if score >= 80 else C.YELLOW if score >= 60 else C.RED
-    log(f"  Privacy score: {score}/100  (grade {grade(score)})", score_color, args.quiet)
+    score_color = C.GREEN if report["score"] >= 80 else C.YELLOW if report["score"] >= 60 else C.RED
+    log(f"  Privacy score: {report['score']}/100  (grade {report['grade']})", score_color, args.quiet)
 
-    print_advice(advice_data, quiet=False)
+    print_advice(report["advice"], quiet=False)
+
+    # Save to history
+    if not args.no_history:
+        try:
+            rid = save_history(report)
+            log(f"\n[i] Saved to history: {rid}", C.DIM)
+            log(f"    View all: python snoop.py --history", C.DIM)
+            log(f"    Dashboard: python snoop.py --dashboard", C.DIM)
+        except Exception as e:
+            log(f"\n[!] Could not save to history: {e}", C.RED)
 
     if args.output:
-        save_report(report, args.output)
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, default=str)
+            log(f"[+] Report saved to {args.output}", C.GREEN)
+        except OSError as e:
+            log(f"[!] Could not write report: {e}", C.RED)
 
     print()
     return 0
