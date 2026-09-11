@@ -10,13 +10,13 @@
 
 Snoop is a single-file privacy auditor for macOS, Linux, and Windows. It scans your system, files, and browsers for privacy issues, then tells you exactly how to fix what it finds.
 
-Run it from the CLI for a quick one-shot report, or launch the built-in **web dashboard** to see your score over time, browse threats, chart severity trends, and schedule automatic audits.
+Run it from the CLI for a quick one-shot report, watch the live progress bar as it works, or launch the built-in **web dashboard** to see your score over time, browse threats, chart severity trends, and schedule automatic audits.
 
 It runs locally. It never phones home. You can read the whole thing in one sitting.
 
 ```
   ╔══════════════════════════════════════════════════════════╗
-  ║  Snoop v2.0.0                                            ║
+  ║  Snoop v2.1.0                                            ║
   ║  The only snoop you'll ever invite in.                   ║
   ║  Local-only · Nothing leaves this machine.               ║
   ╚══════════════════════════════════════════════════════════╝
@@ -24,14 +24,19 @@ It runs locally. It never phones home. You can read the whole thing in one sitti
   ════════════════════════════════════════════════════════════
     SYSTEM SCAN
   ════════════════════════════════════════════════════════════
+  ██████████████████████████  100%         5/5    0.3s  system scan · 5 checks
     [i] OS: Darwin 23.4.0 (arm64)
+    [i] Hostname: macbook.local
     [+] Firewall is enabled (globalstate=1)
     [!] Disk encryption is OFF (FileVault is Off)
     [!] 4 listening port(s) found:
-        127.0.0.1:5000
         0.0.0.0:6379 [HIGH RISK] Redis
         0.0.0.0:27017 [HIGH RISK] MongoDB
-        0.0.0.0:8080
+
+  ════════════════════════════════════════════════════════════
+    FILE SCAN
+  ════════════════════════════════════════════════════════════
+  ████████████████░░░░░░░░░░  62%    31045/50012    4.2s  eta    3s  .env
 
   ════════════════════════════════════════════════════════════
     SCORE
@@ -55,13 +60,14 @@ It runs locally. It never phones home. You can read the whole thing in one sitti
 
 ## Table of contents
 
-- [What's new in v2.0](#whats-new-in-v20)
+- [What's new](#whats-new)
 - [What it checks](#what-it-checks)
 - [Quick start](#quick-start)
 - [Command reference](#command-reference)
 - [The dashboard](#the-dashboard)
 - [Scheduling audits](#scheduling-audits)
 - [History and reports](#history-and-reports)
+- [Progress bar](#progress-bar)
 - [Supported platforms](#supported-platforms)
 - [Privacy guarantees](#privacy-guarantees)
 - [Understanding the score](#understanding-the-score)
@@ -78,16 +84,24 @@ It runs locally. It never phones home. You can read the whole thing in one sitti
 
 ---
 
-## What's new in v2.0
+## What's new
 
-Version 2.0 turns Snoop from a one-shot CLI into a full privacy-monitoring tool. Everything is still a single Python file.
+### v2.1
+
+| Feature | What it does | How to use |
+|---|---|---|
+| 📊 **Live progress bar** | Real-time progress during file scans — percentage, file count, current filename, ETA | Automatic when running in a terminal |
+| 🎯 **Phase indicator** | System and browser scans show which phase is running (firewall → encryption → ports → …) | Automatic |
+| 🔇 **Auto-suppression** | The bar disappears when output is piped or `--quiet` is set, so logs stay clean | Automatic |
+
+### v2.0
 
 | Feature | What it does | How to use |
 |---|---|---|
 | 🌐 **Web dashboard** | Live score gauge, threat list, and charts in your browser | `python snoop.py --dashboard` |
-| 📊 **Charts** | Score gauge, severity bars, category breakdown, score-over-time line chart | Automatic — visible in the dashboard |
+| 📈 **Charts** | Score gauge, severity bars, category breakdown, score-over-time line chart | Visible in the dashboard |
 | 🗓️ **Scheduler** | Automatic recurring audits — pick interval, scan type, path | Toggle in the dashboard, or `--schedule-every` for headless mode |
-| 🕓 **History** | Every scan is saved locally so you can see progress over time | Automatic — view with `--history` |
+| 🕓 **History** | Every scan saved locally so you can see progress over time | Automatic — view with `--history` |
 | ⚡ **Scan now** | Trigger a fresh scan from the dashboard UI | "Scan Now" button |
 | 🔌 **HTTP API** | Every dashboard action is a REST endpoint — script it, wire it into CI | See [Dashboard API](#dashboard-api) |
 | 🏷️ **Threats** | Flattened, sorted list of every finding across all categories | Visible in the dashboard table |
@@ -171,7 +185,7 @@ pip install psutil
 python snoop.py
 ```
 
-That's it. Full scan of your home directory, all checks, report and advice printed to your terminal. The result is also saved to history so the dashboard can chart it later.
+You'll see a live progress bar while Snoop walks your file system. When it finishes, you'll get a report, advice, and a score. The result is saved to history so the dashboard can chart it later.
 
 ### 4. Open the dashboard
 
@@ -185,14 +199,14 @@ A browser tab opens at `http://127.0.0.1:8765/`. You'll see your score, threats,
 
 ## Command reference
 
-Every command in one place, with a plain-English explanation of what it does.
+Every command in one place, with a plain-English explanation.
 
 ### One-shot scans
 
 ```bash
 python snoop.py
 ```
-**Default. Runs all three checks (system + files + browser) against your home directory, prints the report, saves the result to history.**
+**Default. Runs all three checks (system + files + browser) against your home directory, prints the report, saves the result to history.** Shows a live progress bar during the file scan.
 
 ```bash
 python snoop.py --scan system
@@ -202,7 +216,7 @@ python snoop.py --scan system
 ```bash
 python snoop.py --scan files
 ```
-**Runs only the file scan.** Walks your home directory looking for sensitive files, exposed permissions, leaked secrets, and PII.
+**Runs only the file scan.** Walks your home directory looking for sensitive files, exposed permissions, leaked secrets, and PII. This is the scan where the progress bar really shines.
 
 ```bash
 python snoop.py --scan browser
@@ -229,12 +243,17 @@ python snoop.py --output snoop-report.json
 ```bash
 python snoop.py --quiet
 ```
-**Only print the score and advice.** No per-check progress lines. Good for scripts and cron jobs.
+**Only print the score and advice.** No per-check progress lines. No progress bar. Good for scripts and cron jobs.
 
 ```bash
 python snoop.py --no-color
 ```
 **Disable ANSI colors.** Use when piping to a file, logging, or on terminals that render ANSI badly.
+
+```bash
+python snoop.py --no-progress
+```
+**Disable the live progress bar.** Use when you want the detailed log lines but not the bar — for example, when logging to a file that would otherwise be filled with `\r` sequences. Equivalent to setting `NO_PROGRESS=1` in your environment.
 
 ```bash
 python snoop.py --no-history
@@ -318,7 +337,7 @@ python snoop.py --version
 ```bash
 python snoop.py --help
 ```
-**Show all flags with descriptions.** Same content as the Command reference section above, formatted for the terminal.
+**Show all flags with descriptions.** Same content as this section, formatted for the terminal.
 
 ---
 
@@ -340,7 +359,7 @@ It opens `http://127.0.0.1:8765/` — a dark-themed single-page app with everyth
 | **Severity Breakdown** | Horizontal bars for Critical / High / Medium / Low. Instant "how bad is it right now" read. |
 | **Categories** | Distribution of threats across system / network / files / browser, as percentages. |
 | **Score History** | Line chart of every scan you've run. Hover for a shape of your progress over weeks or months. |
-| **Recent Threats** | Every finding from the latest scan, in a sortable-feeling table sorted critical → low. Severity chip, category, title, and the raw detail (file path, port, config key). |
+| **Recent Threats** | Every finding from the latest scan, in a table sorted critical → low. Severity chip, category, title, and the raw detail (file path, port, config key). |
 | **Schedule** | Interval, scan type, and path — saved to `~/.snoop/config.json`. |
 | **Scan Now** | Kicks off an immediate scan in the background. The dashboard auto-refreshes every 5 seconds so the result appears without you reloading. |
 
@@ -511,6 +530,56 @@ curl -s http://127.0.0.1:8765/api/latest | python -c "import json,sys; print(jso
 
 ---
 
+## Progress bar
+
+When you run Snoop in a terminal, you'll see a live progress bar during the file scan:
+
+```
+  ████████████████░░░░░░░░░░  62%    31045/50012    4.2s  eta    3s  .env
+```
+
+Reading left to right:
+
+- **Bar** — filled `█` blocks show how far along you are
+- **Percentage** — how complete the scan is
+- **File count** — `scanned / total`, so you know how many files Snoop found and how many it's processed
+- **Elapsed** — how long the scan has been running
+- **ETA** — estimated time remaining, calculated from the average processing rate
+- **Filename** — the file Snoop is currently analysing
+
+### System and browser scans
+
+System and browser scans run through a fixed set of phases, so instead of a file counter you see a phase label:
+
+```
+  ████████████████████████  100%         5/5    0.3s  system scan · 5 checks
+    [+] Firewall is enabled (globalstate=1)
+    [!] Disk encryption is OFF (FileVault is Off)
+```
+
+Each result line prints *above* the bar, so the log stays in order and the bar keeps moving underneath it.
+
+### Turning it off
+
+```bash
+python snoop.py --no-progress     # disable just the bar
+python snoop.py --quiet           # disables the bar along with other output
+NO_PROGRESS=1 python snoop.py     # disable via environment variable
+```
+
+The bar is **automatically disabled** when:
+
+- stdout isn't a terminal (piping to a file, redirecting, CI logs)
+- `--quiet` is set
+- `NO_PROGRESS` is set in the environment
+- `NO_COLOR` is set in the environment
+
+In all those cases, Snoop prints its normal line-by-line output with no bar and no `\r` sequences, so logs stay readable.
+
+The headless scheduler (`--schedule-every`) and dashboard scans also run with the bar off, since their output goes to a log-style stream where `\r` would be noise.
+
+---
+
 ## Supported platforms
 
 | Platform | Support |
@@ -521,7 +590,7 @@ curl -s http://127.0.0.1:8765/api/latest | python -c "import json,sys; print(jso
 
 Snoop detects the platform and runs the appropriate checks. Anything that doesn't apply is silently skipped.
 
-The dashboard works identically on all three platforms.
+The dashboard and progress bar work identically on all three platforms.
 
 ---
 
@@ -612,7 +681,7 @@ Snoop will recreate the directory and default config on the next run.
 ```json
 {
   "tool": "snoop",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "id": "20260910-143211",
   "timestamp": "2026-09-10T14:32:11",
   "platform": "macOS-14.5-arm64",
@@ -685,8 +754,6 @@ Snoop will recreate the directory and default config on the next run.
 }
 ```
 
-New in v2.0: the `id`, `severity_counts`, and `threats` fields. `threats` is the flattened list the dashboard sorts and displays; `severity_counts` is the aggregate used for the bar chart.
-
 ---
 
 ## Safety notes
@@ -724,7 +791,10 @@ Install it: `pip install psutil`. Without it, Snoop falls back to shell commands
 Expected. Snoop skips files it can't read and moves on. Run as your normal user — you don't need root.
 
 **Scan takes forever**
-Cap it: `--max-files 5000`, or point it at a smaller path: `--path ~/Documents`.
+Cap it: `--max-files 5000`, or point it at a smaller path: `--path ~/Documents`. You'll still see the progress bar, so you can tell it's moving.
+
+**Progress bar looks garbled**
+If your terminal doesn't support ANSI or Unicode block characters, run with `--no-progress` or `--no-color`. When output is piped (e.g. to a file or through `tee`), the bar is disabled automatically.
 
 **Firewall check reports "unknown"**
 On some Linux distros, no firewall manager is installed at all. That's itself a finding — install `ufw` or `firewalld`.
