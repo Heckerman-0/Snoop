@@ -2,7 +2,7 @@
 """
 Snoop — the only snoop you'll ever invite in.
 
-Single-file privacy auditor with CLI and web dashboard.
+Single-file privacy auditor with CLI, web dashboard, and live progress bar.
 Zero dependencies beyond the Python standard library (psutil optional).
 
 Usage:
@@ -43,7 +43,7 @@ IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 TAGLINE = "The only snoop you'll ever invite in."
 SNOOP_HOME = Path.home() / ".snoop"
 HISTORY_DIR = SNOOP_HOME / "history"
@@ -86,6 +86,141 @@ def header(title, quiet=False):
     print(c(bar, C.MAGENTA))
     print(c(f"  {title}", C.BOLD + C.MAGENTA))
     print(c(bar, C.MAGENTA))
+
+
+# ───────────────────────────── Progress bar ─────────────────────────────
+class ProgressBar:
+    """TTY-aware progress bar. Silent when output isn't a terminal.
+
+    Supports:
+      - determinate bar (when total is known)
+      - spinner (when total is unknown)
+      - log() that prints above the bar without clobbering it
+      - automatic suppression on --quiet, --no-progress, or piped output
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, total=None, label="", enabled=True, quiet=False, width=26):
+        self.total = total
+        self.label = label
+        self.width = width
+        self.current = 0
+        self.quiet = quiet
+        self.enabled = (
+            enabled
+            and not quiet
+            and sys.stdout.isatty()
+            and not os.environ.get("NO_PROGRESS")
+        )
+        self._start = time.time()
+        self._last_render = 0.0
+        self._last_len = 0
+        self._finished = False
+
+    # ── internals ──────────────────────────────────────────────────
+    def _term_width(self):
+        try:
+            return os.get_terminal_size().columns
+        except OSError:
+            return 80
+
+    def _clear_line(self):
+        if not self.enabled or self._last_len == 0:
+            return
+        try:
+            sys.stdout.write("\r" + " " * self._last_len + "\r")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+        self._last_len = 0
+
+    def _render(self, force=False):
+        if not self.enabled or self._finished:
+            return
+        now = time.time()
+        if not force and now - self._last_render < 0.08:
+            return
+        self._last_render = now
+        elapsed = now - self._start
+
+        if self.total and self.total > 0:
+            pct = min(1.0, self.current / self.total)
+            filled = int(self.width * pct)
+            bar = "█" * filled + "░" * (self.width - filled)
+            counter = f"{self.current}/{self.total}"
+
+            eta = ""
+            if self.current > 5 and elapsed > 0.5:
+                rate = self.current / elapsed
+                if rate > 0:
+                    remaining = (self.total - self.current) / rate
+                    eta = f"  eta {int(remaining):>4}s"
+
+            line = f"  {bar}  {pct * 100:4.0f}%  {counter:>10}  {elapsed:5.1f}s{eta}"
+        else:
+            spin = self.FRAMES[int(elapsed * 12) % len(self.FRAMES)]
+            line = f"  {spin}  working  {elapsed:5.1f}s"
+
+        if self.label:
+            line += f"  {self.label}"
+
+        cols = self._term_width()
+        line = line[: max(0, cols - 1)]
+        self._last_len = len(line)
+        try:
+            sys.stdout.write("\r" + line)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    # ── public API ─────────────────────────────────────────────────
+    def update(self, current=None, label=None, force=False):
+        if current is not None:
+            self.current = current
+        if label is not None:
+            self.label = label
+        self._render(force=force)
+
+    def advance(self, n=1, label=None):
+        self.current += n
+        if label is not None:
+            self.label = label
+        self._render()
+
+    def log(self, msg, color=C.WHITE):
+        """Print a line, then redraw the bar underneath it.
+
+        Respects the quiet flag — does nothing if quiet.
+        Falls back to plain print() when the bar is disabled.
+        """
+        if self.quiet:
+            return
+        if not self.enabled:
+            print(c(msg, color))
+            return
+        self._clear_line()
+        print(c(msg, color))
+        self._last_render = 0.0
+        self._render(force=True)
+
+    def finish(self, label=None):
+        if self._finished:
+            return
+        self._finished = True
+        if not self.enabled:
+            return
+        if self.total and self.total > 0:
+            self.current = self.total
+        if label is not None:
+            self.label = label
+        self._last_render = 0.0
+        self._render(force=True)
+        try:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
 
 
 # ───────────────────────────── Shell helpers ─────────────────────────────
@@ -330,7 +465,7 @@ def check_guest_account():
     return result
 
 
-def scan_system(quiet=False):
+def scan_system(quiet=False, progress=True):
     findings = {"checks": {}}
     header("SYSTEM SCAN", quiet)
 
@@ -339,48 +474,82 @@ def scan_system(quiet=False):
     log(f"  [i] OS: {info['os']} {info['release']} ({info['machine']})", C.BLUE, quiet)
     log(f"  [i] Hostname: {info['hostname']}", C.BLUE, quiet)
 
+    # Build the phase list based on platform
+    phases = ["firewall", "disk encryption", "open ports", "processes", "auto-login"]
+    if IS_MAC:
+        phases.append("guest account")
+
+    bar = ProgressBar(
+        total=len(phases),
+        label=phases[0],
+        enabled=progress,
+        quiet=quiet,
+    )
+    bar.update(force=True)
+
+    # ── Firewall ──
+    bar.update(label=phases[0])
     fw = check_firewall()
     findings["checks"]["firewall"] = fw
+    bar.advance()
     if fw["enabled"]:
-        log(f"  [+] Firewall is enabled ({fw['details']})", C.GREEN, quiet)
+        bar.log(f"  [+] Firewall is enabled ({fw['details']})", C.GREEN)
     elif fw["enabled"] is False:
-        log(f"  [!] Firewall is DISABLED ({fw['details']})", C.RED, quiet)
+        bar.log(f"  [!] Firewall is DISABLED ({fw['details']})", C.RED)
     else:
-        log(f"  [?] Firewall status unknown ({fw['details']})", C.YELLOW, quiet)
+        bar.log(f"  [?] Firewall status unknown ({fw['details']})", C.YELLOW)
 
+    # ── Disk encryption ──
+    bar.update(label=phases[1])
     enc = check_disk_encryption()
     findings["checks"]["disk_encryption"] = enc
+    bar.advance()
     if enc["encrypted"]:
-        log(f"  [+] Disk encryption is ON ({enc['details']})", C.GREEN, quiet)
+        bar.log(f"  [+] Disk encryption is ON ({enc['details']})", C.GREEN)
     elif enc["encrypted"] is False:
-        log(f"  [!] Disk encryption is OFF ({enc['details']})", C.RED, quiet)
+        bar.log(f"  [!] Disk encryption is OFF ({enc['details']})", C.RED)
 
+    # ── Open ports ──
+    bar.update(label=phases[2])
     ports = check_open_ports()
     findings["open_ports"] = ports
+    bar.advance()
     if ports:
-        log(f"  [!] {len(ports)} listening port(s) found:", C.YELLOW, quiet)
+        bar.log(f"  [!] {len(ports)} listening port(s) found:", C.YELLOW)
         for p in ports[:12]:
             label = RISKY_PORTS.get(p["port"], "")
             marker = c(" [HIGH RISK]", C.RED) if label else ""
-            log(f"      {p['address']}:{p['port']}{marker} {label}", C.WHITE, quiet)
+            bar.log(f"      {p['address']}:{p['port']}{marker} {label}", C.WHITE)
     else:
-        log("  [+] No listening ports found.", C.GREEN, quiet)
+        bar.log("  [+] No listening ports found.", C.GREEN)
 
+    # ── Processes ──
+    bar.update(label=phases[3])
     procs = check_running_processes()
     findings["processes"] = procs
+    bar.advance()
     if procs["count"]:
-        log(f"  [i] {procs['count']} running processes.", C.BLUE, quiet)
+        bar.log(f"  [i] {procs['count']} running processes.", C.BLUE)
 
+    # ── Auto-login ──
+    bar.update(label=phases[4])
     auto = check_auto_login()
     findings["checks"]["auto_login"] = auto
+    bar.advance()
     if auto["enabled"]:
-        log(f"  [!] Auto-login ENABLED ({auto['details']})", C.RED, quiet)
+        bar.log(f"  [!] Auto-login ENABLED ({auto['details']})", C.RED)
 
-    guest = check_guest_account()
-    if guest["enabled"] is not None:
-        findings["checks"]["guest_account"] = guest
-        if guest["enabled"]:
-            log("  [!] Guest account is enabled.", C.YELLOW, quiet)
+    # ── Guest account (macOS) ──
+    if IS_MAC:
+        bar.update(label=phases[5])
+        guest = check_guest_account()
+        if guest["enabled"] is not None:
+            findings["checks"]["guest_account"] = guest
+        bar.advance()
+        if guest.get("enabled"):
+            bar.log("  [!] Guest account is enabled.", C.YELLOW)
+
+    bar.finish(label=f"system scan · {len(phases)} checks")
 
     return findings
 
@@ -494,7 +663,29 @@ def scan_file_content(filepath):
     return findings
 
 
-def scan_directory(root_path, quiet=False, max_files=50000):
+def collect_files(root_path, max_files=50000):
+    """Walk the tree once and return a list of file paths.
+
+    Used to (a) get an accurate total for the progress bar, and
+    (b) avoid walking the same tree twice.
+    """
+    root_path = expand(root_path)
+    files = []
+    if not os.path.isdir(root_path):
+        return files
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIRS and not d.startswith(".")
+        ]
+        for fname in filenames:
+            files.append(os.path.join(dirpath, fname))
+            if len(files) >= max_files:
+                return files
+    return files
+
+
+def scan_directory(root_path, quiet=False, max_files=50000, progress=True):
     root_path = expand(root_path)
     findings = {
         "path": root_path,
@@ -511,35 +702,68 @@ def scan_directory(root_path, quiet=False, max_files=50000):
         return findings
 
     log(f"  [i] Snooping around {root_path} ...", C.BLUE, quiet)
+
+    # Phase 1 — collect (fast walk, no content reads)
+    bar = ProgressBar(
+        total=None,
+        label=f"collecting files in {root_path}",
+        enabled=progress,
+        quiet=quiet,
+    )
+    bar.update(force=True)
     start = time.time()
+    file_list = collect_files(root_path, max_files=max_files)
+    bar.update(current=len(file_list), label="collected", force=True)
+    bar.finish(label=f"{len(file_list)} files found")
 
-    for dirpath, dirnames, filenames in os.walk(root_path):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
-        for fname in filenames:
-            if findings["files_scanned"] >= max_files:
+    if not file_list:
+        log("  [+] No files to scan.", C.GREEN, quiet)
+        return findings
+
+    # Phase 2 — analyse each file
+    bar = ProgressBar(
+        total=len(file_list),
+        label="scanning",
+        enabled=progress,
+        quiet=quiet,
+    )
+    bar.update(force=True)
+
+    for idx, filepath in enumerate(file_list, start=1):
+        findings["files_scanned"] += 1
+
+        # Filename-based checks
+        for pattern, label in SENSITIVE_PATTERNS:
+            if re.search(pattern, filepath, re.IGNORECASE):
+                findings["sensitive_files"].append({"path": filepath, "type": label})
                 break
-            filepath = os.path.join(dirpath, fname)
-            findings["files_scanned"] += 1
 
-            for pattern, label in SENSITIVE_PATTERNS:
-                if re.search(pattern, filepath, re.IGNORECASE):
-                    findings["sensitive_files"].append({"path": filepath, "type": label})
-                    break
+        # Permission checks
+        if is_world_readable(filepath):
+            findings["world_readable"].append(filepath)
+        if is_world_writable(filepath):
+            findings["world_writable"].append(filepath)
 
-            if is_world_readable(filepath):
-                findings["world_readable"].append(filepath)
-            if is_world_writable(filepath):
-                findings["world_writable"].append(filepath)
+        # Content checks
+        content_hits = scan_file_content(filepath)
+        if content_hits.get("secrets"):
+            findings["with_secrets"].append(
+                {"path": filepath, "types": content_hits["secrets"]}
+            )
+        if content_hits.get("pii"):
+            findings["with_pii"].append(
+                {"path": filepath, "types": content_hits["pii"]}
+            )
 
-            content_hits = scan_file_content(filepath)
-            if content_hits.get("secrets"):
-                findings["with_secrets"].append({"path": filepath, "types": content_hits["secrets"]})
-            if content_hits.get("pii"):
-                findings["with_pii"].append({"path": filepath, "types": content_hits["pii"]})
+        # Redraw progress every ~10 files (and always on the last one)
+        if idx % 10 == 0 or idx == len(file_list):
+            display = os.path.basename(filepath)[:40] or filepath[:40]
+            bar.update(current=idx, label=display)
 
     elapsed = time.time() - start
-    log(f"  [i] Poked at {findings['files_scanned']} files in {elapsed:.1f}s", C.BLUE, quiet)
+    bar.finish(label=f"done · {findings['files_scanned']} files in {elapsed:.1f}s")
 
+    # Summary
     if findings["sensitive_files"]:
         log(f"  [!] {len(findings['sensitive_files'])} sensitive file(s)", C.YELLOW, quiet)
     if findings["world_readable"]:
@@ -585,29 +809,42 @@ BROWSER_PATHS = {
 }
 
 
-def scan_browser(quiet=False):
+def scan_browser(quiet=False, progress=True):
     findings = {"browsers": [], "issues": []}
 
     platform_key = sys.platform
+    candidates = []
     for name, paths in BROWSER_PATHS.items():
         root = paths.get(platform_key)
         if not root:
             continue
-        expanded = expand(root)
+        candidates.append((name, expand(root)))
+
+    bar = ProgressBar(
+        total=len(candidates),
+        label="probing browsers",
+        enabled=progress,
+        quiet=quiet,
+    )
+    bar.update(force=True)
+
+    for name, expanded in candidates:
+        bar.update(label=f"checking {name}")
         if os.path.isdir(expanded):
             findings["browsers"].append({"name": name, "path": expanded})
+            issues = _check_firefox(expanded) if name == "Firefox" else _check_chromium(expanded)
+            for issue in issues:
+                findings["issues"].append({"browser": name, **issue})
+        bar.advance()
+
+    bar.finish(label=f"browser scan · {len(findings['browsers'])} found")
 
     if not findings["browsers"]:
         log("  [i] No browser profiles detected.", C.BLUE, quiet)
         return findings
 
     for browser in findings["browsers"]:
-        name = browser["name"]
-        log(f"  [+] {name} found at {browser['path']}", C.GREEN, quiet)
-        issues = _check_firefox(browser["path"]) if name == "Firefox" else _check_chromium(browser["path"])
-        for issue in issues:
-            findings["issues"].append({"browser": name, **issue})
-
+        log(f"  [+] {browser['name']} found at {browser['path']}", C.GREEN, quiet)
     for issue in findings["issues"]:
         log(f"  [!] {issue['browser']}: {issue['title']}", C.YELLOW, quiet)
 
@@ -873,7 +1110,8 @@ def severity_counts(threats):
     return counts
 
 
-def run_full_scan(scan_type="all", path=None, quiet=False, max_files=50000):
+def run_full_scan(scan_type="all", path=None, quiet=False,
+                  max_files=50000, progress=True):
     """Run scans and return a complete report dict."""
     if path is None:
         path = os.path.expanduser("~")
@@ -891,17 +1129,19 @@ def run_full_scan(scan_type="all", path=None, quiet=False, max_files=50000):
     browser_findings = {}
 
     if scan_type in ("all", "system"):
-        system_findings = scan_system(quiet=quiet)
+        system_findings = scan_system(quiet=quiet, progress=progress)
         report["system"] = system_findings
     if scan_type in ("all", "files"):
         if not quiet:
             header("FILE SCAN", quiet)
-        file_findings = scan_directory(path, quiet=quiet, max_files=max_files)
+        file_findings = scan_directory(
+            path, quiet=quiet, max_files=max_files, progress=progress,
+        )
         report["files"] = file_findings
     if scan_type in ("all", "browser"):
         if not quiet:
             header("BROWSER SCAN", quiet)
-        browser_findings = scan_browser(quiet=quiet)
+        browser_findings = scan_browser(quiet=quiet, progress=progress)
         report["browser"] = browser_findings
 
     advice_data = build_advice(system_findings, file_findings, browser_findings)
@@ -1011,7 +1251,6 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        # Merge with defaults
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
         return cfg
@@ -1083,6 +1322,7 @@ class Scheduler:
                 path=path,
                 quiet=True,
                 max_files=max_files,
+                progress=False,
             )
             rid = save_history(report)
             cfg = load_config()
@@ -1552,7 +1792,6 @@ function renderGauge(score) {
   const cx = 90, cy = 100, r = 70;
   const startAngle = 180;
   const endAngle = 0;
-  const totalAngle = 180;
 
   function polar(cx, cy, r, deg) {
     const rad = deg * Math.PI / 180;
@@ -1622,7 +1861,7 @@ function renderCategoryChart(threats) {
     const pct = Math.round((n / total) * 100);
     html += `
       <div style="display:flex; align-items:center; gap:10px; font-size:13px;">
-        <span class="swatch" style="background:${CATEGORY_COLORS[cat] || '#888'}; width:10px; height:10px; border-radius:2px; display:inline-block;"></span>
+        <span style="background:${CATEGORY_COLORS[cat] || '#888'}; width:10px; height:10px; border-radius:2px; display:inline-block;"></span>
         <span style="width:70px; text-transform:capitalize;">${cat}</span>
         <span class="mono muted" style="width:40px; text-align:right;">${n}</span>
         <div style="flex:1; height:6px; background:#0d1117; border-radius:3px; overflow:hidden;">
@@ -1643,7 +1882,6 @@ function renderHistoryChart(history) {
   const chartW = W - pad.l - pad.r;
   const chartH = H - pad.t - pad.b;
 
-  // history newest first → reverse for chronological
   const data = history.slice().reverse();
 
   if (data.length === 0) {
@@ -1663,7 +1901,6 @@ function renderHistoryChart(history) {
 
   const points = data.map((d, i) => `${xs(i)},${ys(d.score)}`).join(' ');
 
-  // area fill
   const areaPath = `M ${xs(0)} ${ys(data[0].score)} `
     + data.map((d, i) => `L ${xs(i)} ${ys(d.score)}`).join(' ')
     + ` L ${xs(data.length - 1)} ${H - pad.b} L ${xs(0)} ${H - pad.b} Z`;
@@ -1675,7 +1912,6 @@ function renderHistoryChart(history) {
     dots += `<circle cx="${cx}" cy="${cy}" r="3.5" fill="${color}" stroke="#161b22" stroke-width="1.5"/>`;
   });
 
-  // x-axis labels (sparse if many points)
   let xlabels = '';
   const step = Math.max(1, Math.ceil(data.length / 8));
   data.forEach((d, i) => {
@@ -1734,7 +1970,6 @@ async function refresh() {
       : (status.last_scan ? `last scan ${status.last_scan.timestamp.replace('T',' ').slice(0,16)}` : 'idle');
     el('pulse').className = 'pulse' + (status.scanning ? ' scanning' : '');
 
-    // Schedule form
     const sched = status.schedule || {};
     if (document.activeElement !== el('sched-enabled'))
       el('sched-enabled').checked = !!sched.enabled;
@@ -1749,7 +1984,6 @@ async function refresh() {
       ? `Next run: ${sched.next_run ? sched.next_run.replace('T',' ').slice(0,16) : 'pending'}`
       : 'Scheduler is off.';
 
-    // Latest report
     if (status.last_scan && status.last_scan.id) {
       const report = await api('/api/report/' + encodeURIComponent(status.last_scan.id));
       renderGauge(report.score);
@@ -1767,7 +2001,6 @@ async function refresh() {
       renderThreats([]);
     }
 
-    // History chart
     const hist = await api('/api/history?limit=60');
     renderHistoryChart(hist);
 
@@ -1777,7 +2010,6 @@ async function refresh() {
   }
 }
 
-// ─── Event wiring ──────────────────────────────────────────────────
 el('scan-now').addEventListener('click', async () => {
   el('scan-now').disabled = true;
   try {
@@ -1823,7 +2055,6 @@ el('delete-all').addEventListener('click', async () => {
   }
 });
 
-// Auto-refresh
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -1838,7 +2069,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
     scheduler = None  # set by serve_dashboard
 
     def log_message(self, format, *args):
-        # Silence default request logging; comment this out for debug
         pass
 
     def _send(self, status, body, content_type="application/json"):
@@ -1991,7 +2221,7 @@ def find_free_port(start=8765, end=8775):
 def serve_dashboard(port=8765, open_browser=True):
     """Start the dashboard server and scheduler. Blocks until Ctrl+C."""
     ensure_dirs()
-    load_config()  # ensure config exists
+    load_config()
 
     if port == 0:
         port = find_free_port()
@@ -2053,6 +2283,8 @@ def parse_args(argv=None):
                    help="Suppress progress output (only advice + score)")
     p.add_argument("--no-color", action="store_true",
                    help="Disable ANSI colors")
+    p.add_argument("--no-progress", action="store_true",
+                   help="Disable the live progress bar")
     p.add_argument("--max-files", type=int, default=50000,
                    help="Cap on files scanned (default 50000)")
     p.add_argument("--no-history", action="store_true",
@@ -2142,7 +2374,10 @@ def headless_schedule(interval_hours, scan_type, path, max_files):
         start = datetime.now()
         print(c(f"[{start:%Y-%m-%d %H:%M:%S}] Starting scheduled scan…", C.MAGENTA))
         try:
-            report = run_full_scan(scan_type=scan_type, path=path, quiet=True, max_files=max_files)
+            report = run_full_scan(
+                scan_type=scan_type, path=path,
+                quiet=True, max_files=max_files, progress=False,
+            )
             rid = save_history(report)
             threats = report.get("severity_counts", {})
             total = sum(threats.values()) if threats else 0
@@ -2191,11 +2426,18 @@ def main(argv=None):
         log("\n[i] psutil not installed — some checks will use fallbacks.", C.YELLOW)
         log("    Install for best results: pip install psutil", C.DIM)
 
+    use_progress = (
+        not args.no_progress
+        and not args.quiet
+        and not os.environ.get("NO_PROGRESS")
+    )
+
     report = run_full_scan(
         scan_type=args.scan,
         path=args.path,
         quiet=args.quiet,
         max_files=args.max_files,
+        progress=use_progress,
     )
 
     header("SCORE", args.quiet)
@@ -2204,7 +2446,6 @@ def main(argv=None):
 
     print_advice(report["advice"], quiet=False)
 
-    # Save to history
     if not args.no_history:
         try:
             rid = save_history(report)
