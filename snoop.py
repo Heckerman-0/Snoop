@@ -17,6 +17,7 @@ License: MIT
 """
 
 import argparse
+import copy
 import json
 import os
 import platform
@@ -43,7 +44,7 @@ IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 TAGLINE = "The only snoop you'll ever invite in."
 SNOOP_HOME = Path.home() / ".snoop"
 HISTORY_DIR = SNOOP_HOME / "history"
@@ -96,7 +97,8 @@ class ProgressBar:
       - determinate bar (when total is known)
       - spinner (when total is unknown)
       - log() that prints above the bar without clobbering it
-      - automatic suppression on --quiet, --no-progress, or piped output
+      - automatic suppression on --quiet, --no-progress, piped output,
+        NO_COLOR, or NO_PROGRESS
     """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -110,13 +112,21 @@ class ProgressBar:
         self.enabled = (
             enabled
             and not quiet
-            and sys.stdout.isatty()
+            and self._isatty()
             and not os.environ.get("NO_PROGRESS")
+            and not os.environ.get("NO_COLOR")
         )
         self._start = time.time()
         self._last_render = 0.0
         self._last_len = 0
         self._finished = False
+
+    @staticmethod
+    def _isatty():
+        try:
+            return sys.stdout.isatty()
+        except (AttributeError, ValueError):
+            return False
 
     # ── internals ──────────────────────────────────────────────────
     def _term_width(self):
@@ -189,11 +199,7 @@ class ProgressBar:
         self._render()
 
     def log(self, msg, color=C.WHITE):
-        """Print a line, then redraw the bar underneath it.
-
-        Respects the quiet flag — does nothing if quiet.
-        Falls back to plain print() when the bar is disabled.
-        """
+        """Print a line, then redraw the bar underneath it."""
         if self.quiet:
             return
         if not self.enabled:
@@ -256,6 +262,19 @@ def read_text(path, max_bytes=2_000_000):
         return None
 
 
+def atomic_write_json(path, data):
+    """Write JSON atomically: temp file, fsync, rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+        try:
+            f.flush()
+            os.fsync(f.fileno())
+        except (OSError, ValueError):
+            pass
+    os.replace(tmp, path)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # SYSTEM SCAN
 # ══════════════════════════════════════════════════════════════════════════
@@ -277,7 +296,7 @@ def check_firewall():
     if IS_WIN:
         out, _, code = run(["netsh", "advfirewall", "show", "allprofiles", "state"])
         if code == 0:
-            states = re.findall(r"State\s+(\w+)", out)
+            states = re.findall(r"^\s*State\s+(\w+)", out, re.MULTILINE)
             enabled = all(s.upper() == "ON" for s in states) and len(states) > 0
             result["enabled"] = enabled
             result["details"] = f"Profiles: {', '.join(states) or 'unknown'}"
@@ -329,6 +348,17 @@ def check_disk_encryption():
         if code == 0:
             result["encrypted"] = "Fully Encrypted" in out or "Fully Decrypted" not in out
             result["details"] = "BitLocker status checked"
+        else:
+            # manage-bde is missing on Windows Home editions — try PowerShell
+            ps_out, _, ps_code = run([
+                "powershell", "-NoProfile", "-Command",
+                "(Get-BitLockerVolume -MountPoint $env:SystemDrive).ProtectionStatus"
+            ], timeout=20)
+            if ps_code == 0:
+                status = ps_out.strip().lower()
+                # ProtectionStatus: 0 = Off, 1 = On, 2 = Unknown
+                result["encrypted"] = status in ("1", "on")
+                result["details"] = f"BitLocker ProtectionStatus={status or 'unknown'}"
 
     elif IS_LINUX:
         out, _, code = run(["lsblk", "-o", "NAME,TYPE,FSTYPE", "-n"])
@@ -465,6 +495,14 @@ def check_guest_account():
     return result
 
 
+def _safe(fn, default):
+    """Call fn(), returning default if it raises. Used to isolate check failures."""
+    try:
+        return fn(), None
+    except Exception as e:
+        return default, str(e)
+
+
 def scan_system(quiet=False, progress=True):
     findings = {"checks": {}}
     header("SYSTEM SCAN", quiet)
@@ -474,7 +512,6 @@ def scan_system(quiet=False, progress=True):
     log(f"  [i] OS: {info['os']} {info['release']} ({info['machine']})", C.BLUE, quiet)
     log(f"  [i] Hostname: {info['hostname']}", C.BLUE, quiet)
 
-    # Build the phase list based on platform
     phases = ["firewall", "disk encryption", "open ports", "processes", "auto-login"]
     if IS_MAC:
         phases.append("guest account")
@@ -489,10 +526,12 @@ def scan_system(quiet=False, progress=True):
 
     # ── Firewall ──
     bar.update(label=phases[0])
-    fw = check_firewall()
+    fw, err = _safe(check_firewall, {"enabled": None, "details": ""})
     findings["checks"]["firewall"] = fw
     bar.advance()
-    if fw["enabled"]:
+    if err:
+        bar.log(f"  [!] firewall check failed: {err}", C.YELLOW)
+    elif fw["enabled"]:
         bar.log(f"  [+] Firewall is enabled ({fw['details']})", C.GREEN)
     elif fw["enabled"] is False:
         bar.log(f"  [!] Firewall is DISABLED ({fw['details']})", C.RED)
@@ -501,20 +540,24 @@ def scan_system(quiet=False, progress=True):
 
     # ── Disk encryption ──
     bar.update(label=phases[1])
-    enc = check_disk_encryption()
+    enc, err = _safe(check_disk_encryption, {"encrypted": None, "details": ""})
     findings["checks"]["disk_encryption"] = enc
     bar.advance()
-    if enc["encrypted"]:
+    if err:
+        bar.log(f"  [!] disk encryption check failed: {err}", C.YELLOW)
+    elif enc["encrypted"]:
         bar.log(f"  [+] Disk encryption is ON ({enc['details']})", C.GREEN)
     elif enc["encrypted"] is False:
         bar.log(f"  [!] Disk encryption is OFF ({enc['details']})", C.RED)
 
     # ── Open ports ──
     bar.update(label=phases[2])
-    ports = check_open_ports()
+    ports, err = _safe(check_open_ports, [])
     findings["open_ports"] = ports
     bar.advance()
-    if ports:
+    if err:
+        bar.log(f"  [!] port scan failed: {err}", C.YELLOW)
+    elif ports:
         bar.log(f"  [!] {len(ports)} listening port(s) found:", C.YELLOW)
         for p in ports[:12]:
             label = RISKY_PORTS.get(p["port"], "")
@@ -525,28 +568,34 @@ def scan_system(quiet=False, progress=True):
 
     # ── Processes ──
     bar.update(label=phases[3])
-    procs = check_running_processes()
+    procs, err = _safe(check_running_processes, {"count": None, "top": []})
     findings["processes"] = procs
     bar.advance()
-    if procs["count"]:
+    if err:
+        bar.log(f"  [!] process check failed: {err}", C.YELLOW)
+    elif procs["count"]:
         bar.log(f"  [i] {procs['count']} running processes.", C.BLUE)
 
     # ── Auto-login ──
     bar.update(label=phases[4])
-    auto = check_auto_login()
+    auto, err = _safe(check_auto_login, {"enabled": False, "details": ""})
     findings["checks"]["auto_login"] = auto
     bar.advance()
-    if auto["enabled"]:
+    if err:
+        bar.log(f"  [!] auto-login check failed: {err}", C.YELLOW)
+    elif auto["enabled"]:
         bar.log(f"  [!] Auto-login ENABLED ({auto['details']})", C.RED)
 
     # ── Guest account (macOS) ──
     if IS_MAC:
         bar.update(label=phases[5])
-        guest = check_guest_account()
-        if guest["enabled"] is not None:
+        guest, err = _safe(check_guest_account, {"enabled": None, "details": ""})
+        if guest.get("enabled") is not None:
             findings["checks"]["guest_account"] = guest
         bar.advance()
-        if guest.get("enabled"):
+        if err:
+            bar.log(f"  [!] guest account check failed: {err}", C.YELLOW)
+        elif guest.get("enabled"):
             bar.log("  [!] Guest account is enabled.", C.YELLOW)
 
     bar.finish(label=f"system scan · {len(phases)} checks")
@@ -664,11 +713,7 @@ def scan_file_content(filepath):
 
 
 def collect_files(root_path, max_files=50000):
-    """Walk the tree once and return a list of file paths.
-
-    Used to (a) get an accurate total for the progress bar, and
-    (b) avoid walking the same tree twice.
-    """
+    """Walk the tree once and return a list of file paths."""
     root_path = expand(root_path)
     files = []
     if not os.path.isdir(root_path):
@@ -697,13 +742,23 @@ def scan_directory(root_path, quiet=False, max_files=50000, progress=True):
         "files_scanned": 0,
     }
 
-    if not os.path.isdir(root_path):
+    if not os.path.exists(root_path):
         log(f"  [!] Path not found: {root_path}", C.RED, quiet)
+        return findings
+
+    # If user pointed --path at a file, use its containing directory
+    if os.path.isfile(root_path):
+        root_path = os.path.dirname(os.path.abspath(root_path))
+        findings["path"] = root_path
+        log(f"  [i] Path was a file, scanning its directory: {root_path}", C.BLUE, quiet)
+
+    if not os.path.isdir(root_path):
+        log(f"  [!] Not a directory: {root_path}", C.RED, quiet)
         return findings
 
     log(f"  [i] Snooping around {root_path} ...", C.BLUE, quiet)
 
-    # Phase 1 — collect (fast walk, no content reads)
+    # Phase 1 — collect
     bar = ProgressBar(
         total=None,
         label=f"collecting files in {root_path}",
@@ -732,19 +787,16 @@ def scan_directory(root_path, quiet=False, max_files=50000, progress=True):
     for idx, filepath in enumerate(file_list, start=1):
         findings["files_scanned"] += 1
 
-        # Filename-based checks
         for pattern, label in SENSITIVE_PATTERNS:
             if re.search(pattern, filepath, re.IGNORECASE):
                 findings["sensitive_files"].append({"path": filepath, "type": label})
                 break
 
-        # Permission checks
         if is_world_readable(filepath):
             findings["world_readable"].append(filepath)
         if is_world_writable(filepath):
             findings["world_writable"].append(filepath)
 
-        # Content checks
         content_hits = scan_file_content(filepath)
         if content_hits.get("secrets"):
             findings["with_secrets"].append(
@@ -755,7 +807,6 @@ def scan_directory(root_path, quiet=False, max_files=50000, progress=True):
                 {"path": filepath, "types": content_hits["pii"]}
             )
 
-        # Redraw progress every ~10 files (and always on the last one)
         if idx % 10 == 0 or idx == len(file_list):
             display = os.path.basename(filepath)[:40] or filepath[:40]
             bar.update(current=idx, label=display)
@@ -763,7 +814,6 @@ def scan_directory(root_path, quiet=False, max_files=50000, progress=True):
     elapsed = time.time() - start
     bar.finish(label=f"done · {findings['files_scanned']} files in {elapsed:.1f}s")
 
-    # Summary
     if findings["sensitive_files"]:
         log(f"  [!] {len(findings['sensitive_files'])} sensitive file(s)", C.YELLOW, quiet)
     if findings["world_readable"]:
@@ -832,7 +882,10 @@ def scan_browser(quiet=False, progress=True):
         bar.update(label=f"checking {name}")
         if os.path.isdir(expanded):
             findings["browsers"].append({"name": name, "path": expanded})
-            issues = _check_firefox(expanded) if name == "Firefox" else _check_chromium(expanded)
+            try:
+                issues = _check_firefox(expanded) if name == "Firefox" else _check_chromium(expanded)
+            except Exception:
+                issues = []
             for issue in issues:
                 findings["issues"].append({"browser": name, **issue})
         bar.advance()
@@ -1023,7 +1076,7 @@ def grade(score):
     return "F"
 
 
-def extract_threats(system, files, browser, advice_data):
+def extract_threats(system, files, browser):
     """Flatten findings into a list of threat objects for the dashboard."""
     threats = []
 
@@ -1151,7 +1204,7 @@ def run_full_scan(scan_type="all", path=None, quiet=False,
     report["score"] = score
     report["grade"] = grade(score)
 
-    threats = extract_threats(system_findings, file_findings, browser_findings, advice_data)
+    threats = extract_threats(system_findings, file_findings, browser_findings)
     report["threats"] = threats
     report["severity_counts"] = severity_counts(threats)
 
@@ -1181,8 +1234,7 @@ def save_history(report):
     report["id"] = rid
     path = HISTORY_DIR / f"{rid}.json"
     with _STORAGE_LOCK:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, default=str)
+        atomic_write_json(path, report)
     return rid
 
 
@@ -1246,23 +1298,23 @@ DEFAULT_CONFIG = {
 def load_config():
     ensure_dirs()
     if not CONFIG_FILE.exists():
-        save_config(DEFAULT_CONFIG)
-        return dict(DEFAULT_CONFIG)
+        default = copy.deepcopy(DEFAULT_CONFIG)
+        save_config(default)
+        return default
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         for k, v in DEFAULT_CONFIG.items():
-            cfg.setdefault(k, v)
+            cfg.setdefault(k, copy.deepcopy(v))
         return cfg
     except (OSError, json.JSONDecodeError):
-        return dict(DEFAULT_CONFIG)
+        return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_config(cfg):
     ensure_dirs()
     with _STORAGE_LOCK:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+        atomic_write_json(CONFIG_FILE, cfg)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1345,7 +1397,6 @@ class Scheduler:
             self._scan_lock.release()
 
     def _loop(self):
-        # Give the server a moment to start up
         time.sleep(2)
         while not self._stop.is_set():
             try:
@@ -1456,7 +1507,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   main {
-    padding: 22px 28px 60px;
+    padding: 22px 28px 40px;
     max-width: 1280px;
     margin: 0 auto;
   }
@@ -1498,33 +1549,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     color: var(--muted);
     margin-top: 6px;
   }
-
-  .legend {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px 18px;
-    margin-top: 8px;
-    font-size: 12px;
-    color: var(--muted);
-  }
-  .legend .swatch {
-    display: inline-block;
-    width: 10px; height: 10px;
-    border-radius: 2px;
-    margin-right: 6px;
-    vertical-align: middle;
-  }
-
-  .stat-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 8px 0;
-    border-bottom: 1px solid var(--border);
-    font-size: 13px;
-  }
-  .stat-row:last-child { border-bottom: none; }
-  .stat-row .label { color: var(--muted); }
-  .stat-row .value { font-weight: 600; font-variant-numeric: tabular-nums; }
 
   .chart-svg { display: block; width: 100%; height: auto; overflow: visible; }
 
@@ -1658,6 +1682,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     text-align: center;
   }
 
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 11px;
+    padding: 10px 20px 30px;
+  }
+
   @media (max-width: 640px) {
     header { padding: 14px 16px; }
     header .tagline { display: none; }
@@ -1712,7 +1743,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="card">
     <h2>Recent Threats</h2>
     <div class="threats-scroll">
-      <table id="threats-table">
+      <table>
         <thead>
           <tr><th style="width:90px">Severity</th><th style="width:100px">Category</th><th>Threat</th><th class="muted">Detail</th></tr>
         </thead>
@@ -1757,6 +1788,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </main>
 
+<footer>
+  Snoop v__VERSION__ · local only · nothing leaves this machine
+</footer>
+
 <script>
 const SEVERITY_COLORS = {
   critical: '#ef4444',
@@ -1786,12 +1821,11 @@ function showBanner(msg, isError) {
   setTimeout(() => { b.className = 'banner'; }, 4000);
 }
 
-// ─── Gauge ──────────────────────────────────────────────────────────
 function renderGauge(score) {
+  score = Number(score) || 0;
   const svg = el('gauge');
   const cx = 90, cy = 100, r = 70;
-  const startAngle = 180;
-  const endAngle = 0;
+  const startAngle = 180, endAngle = 0;
 
   function polar(cx, cy, r, deg) {
     const rad = deg * Math.PI / 180;
@@ -1818,7 +1852,6 @@ function renderGauge(score) {
   `;
 }
 
-// ─── Severity bar chart ────────────────────────────────────────────
 function renderSeverityChart(counts) {
   const container = el('severity-chart');
   const levels = ['critical', 'high', 'medium', 'low'];
@@ -1843,7 +1876,6 @@ function renderSeverityChart(counts) {
   container.innerHTML = html;
 }
 
-// ─── Category distribution ─────────────────────────────────────────
 function renderCategoryChart(threats) {
   const container = el('category-chart');
   const counts = { system: 0, network: 0, files: 0, browser: 0 };
@@ -1874,7 +1906,6 @@ function renderCategoryChart(threats) {
   container.innerHTML = html;
 }
 
-// ─── History line chart ────────────────────────────────────────────
 function renderHistoryChart(history) {
   const svg = el('history-chart');
   const W = 800, H = 220;
@@ -1935,7 +1966,6 @@ function renderHistoryChart(history) {
   `;
 }
 
-// ─── Threats table ─────────────────────────────────────────────────
 function renderThreats(threats) {
   const body = el('threats-body');
   if (!threats || threats.length === 0) {
@@ -1955,7 +1985,6 @@ function renderThreats(threats) {
   `).join('');
 }
 
-// ─── API helpers ───────────────────────────────────────────────────
 async function api(path, opts) {
   const res = await fetch(path, opts);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -2068,18 +2097,54 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     scheduler = None  # set by serve_dashboard
 
+    # Quiet the default request logger
     def log_message(self, format, *args):
         pass
+
+    # ── helpers ────────────────────────────────────────────────────
+    def _same_origin(self):
+        """Return True if the request looks same-origin (or non-browser).
+
+        Browsers always send an Origin header on cross-origin fetch/POST.
+        A page at evil.com trying to POST to 127.0.0.1:8765 will include
+        Origin: https://evil.com, which we reject. curl and native clients
+        often omit Origin entirely — those are allowed.
+        """
+        origin = self.headers.get("Origin", "")
+        referer = self.headers.get("Referer", "")
+        loopback = ("127.0.0.1", "localhost", "[::1]")
+
+        if origin:
+            return any(h in origin for h in loopback)
+        if referer:
+            return any(h in referer for h in loopback)
+        return True
 
     def _send(self, status, body, content_type="application/json"):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, default=str).encode("utf-8")
         elif isinstance(body, str):
             body = body.encode("utf-8")
+
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        if content_type.startswith("text/html"):
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data:; "
+                "connect-src 'self'; "
+                "frame-ancestors 'none'; "
+                "base-uri 'none'; "
+                "form-action 'none'",
+            )
         self.end_headers()
         self.wfile.write(body)
 
@@ -2092,6 +2157,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return {}
 
+    def _forbidden(self):
+        return self._send(403, {"error": "cross-origin request rejected"})
+
+    # ── HTTP methods ───────────────────────────────────────────────
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -2099,7 +2168,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         try:
             if path == "/" or path == "/index.html":
-                html = DASHBOARD_HTML.replace("__TAGLINE__", TAGLINE).replace("__VERSION__", VERSION)
+                html = (
+                    DASHBOARD_HTML
+                    .replace("__TAGLINE__", TAGLINE)
+                    .replace("__VERSION__", VERSION)
+                )
                 return self._send(200, html, "text/html; charset=utf-8")
 
             if path == "/api/status":
@@ -2116,7 +2189,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 })
 
             if path == "/api/history":
-                limit = int(query.get("limit", ["60"])[0])
+                raw = query.get("limit", ["60"])[0]
+                try:
+                    limit = int(raw)
+                except (ValueError, TypeError):
+                    limit = 60
+                limit = max(1, min(limit, 500))
                 return self._send(200, list_history(limit=limit))
 
             if path == "/api/latest":
@@ -2143,6 +2221,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send(500, {"error": str(e)})
 
     def do_POST(self):
+        if not self._same_origin():
+            return self._forbidden()
+
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -2153,7 +2234,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 scan_type = body.get("scan_type", "all")
                 scan_path = body.get("path") or None
-                max_files = int(body.get("max_files", 50000))
+                try:
+                    max_files = int(body.get("max_files", 50000))
+                except (ValueError, TypeError):
+                    max_files = 50000
                 ok = self.scheduler.run_now(scan_type=scan_type, path=scan_path, max_files=max_files)
                 return self._send(200, {"ok": ok, "message": "scan started" if ok else "scan already running"})
 
@@ -2162,10 +2246,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 cfg = load_config()
                 sched = cfg.setdefault("schedule", {})
                 sched["enabled"] = bool(body.get("enabled", False))
-                sched["interval_hours"] = int(body.get("interval_hours", 24))
+                try:
+                    sched["interval_hours"] = max(1, int(body.get("interval_hours", 24)))
+                except (ValueError, TypeError):
+                    sched["interval_hours"] = 24
                 sched["scan_type"] = body.get("scan_type", "all")
                 sched["path"] = body.get("path", "~")
-                sched["max_files"] = int(body.get("max_files", 50000))
+                try:
+                    sched["max_files"] = int(body.get("max_files", 50000))
+                except (ValueError, TypeError):
+                    sched["max_files"] = 50000
                 if sched["enabled"]:
                     next_run = datetime.now() + timedelta(hours=sched["interval_hours"])
                     sched["next_run"] = next_run.isoformat(timespec="seconds")
@@ -2180,6 +2270,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._send(500, {"error": str(e)})
 
     def do_DELETE(self):
+        if not self._same_origin():
+            return self._forbidden()
+
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -2207,6 +2300,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def find_free_port(start=8765, end=8775):
+    """Return the first free port in [start, end], or None."""
     import socket
     for p in range(start, end + 1):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -2215,7 +2309,7 @@ def find_free_port(start=8765, end=8775):
                 return p
             except OSError:
                 continue
-    return start
+    return None
 
 
 def serve_dashboard(port=8765, open_browser=True):
@@ -2223,16 +2317,30 @@ def serve_dashboard(port=8765, open_browser=True):
     ensure_dirs()
     load_config()
 
+    # Resolve the port. port=0 means "find a free one, or let the OS pick".
+    requested_port = port
     if port == 0:
         port = find_free_port()
+    if port is None:
+        port = 0  # OS picks any free port
 
     scheduler = Scheduler()
     scheduler.start()
 
     handler = type("Handler", (DashboardHandler,), {"scheduler": scheduler})
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    url = f"http://127.0.0.1:{port}/"
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    except OSError as e:
+        scheduler.stop()
+        print()
+        print(c(f"[!] Could not bind 127.0.0.1:{requested_port or port}: {e}", C.RED))
+        print(c(f"    Try a different port: python snoop.py --dashboard --port 9000", C.DIM))
+        print(c(f"    Or let the OS pick one: python snoop.py --dashboard --port 0", C.DIM))
+        return 1
+
+    actual_port = server.server_address[1]
+    url = f"http://127.0.0.1:{actual_port}/"
 
     print()
     print(c("╔" + "═" * 58 + "╗", C.MAGENTA))
@@ -2259,7 +2367,10 @@ def serve_dashboard(port=8765, open_browser=True):
         print(c("\n[*] Shutting down…", C.YELLOW))
     finally:
         scheduler.stop()
-        server.shutdown()
+        try:
+            server.shutdown()
+        except Exception:
+            pass
     return 0
 
 
@@ -2363,16 +2474,17 @@ def parse_interval(s):
     return n
 
 
-def headless_schedule(interval_hours, scan_type, path, max_files):
+def headless_schedule(interval_hours, scan_type, path, max_files, quiet=False):
     """Run scans on a fixed interval, headless (no HTTP server)."""
-    print_banner()
-    print(c(f"  Headless mode · scanning every {interval_hours}h", C.CYAN))
-    print(c(f"  Reports saved to {HISTORY_DIR}", C.BLUE))
-    print(c("  Press Ctrl+C to stop.\n", C.DIM))
+    if not quiet:
+        print_banner()
+        print(c(f"  Headless mode · scanning every {interval_hours}h", C.CYAN))
+        print(c(f"  Reports saved to {HISTORY_DIR}", C.BLUE))
+        print(c("  Press Ctrl+C to stop.\n", C.DIM))
 
     while True:
         start = datetime.now()
-        print(c(f"[{start:%Y-%m-%d %H:%M:%S}] Starting scheduled scan…", C.MAGENTA))
+        log(f"[{start:%Y-%m-%d %H:%M:%S}] Starting scheduled scan…", C.MAGENTA, quiet)
         try:
             report = run_full_scan(
                 scan_type=scan_type, path=path,
@@ -2382,16 +2494,16 @@ def headless_schedule(interval_hours, scan_type, path, max_files):
             threats = report.get("severity_counts", {})
             total = sum(threats.values()) if threats else 0
             color = C.GREEN if report["score"] >= 80 else C.YELLOW if report["score"] >= 60 else C.RED
-            print(c(f"  → {rid}  score={report['score']}  grade={report['grade']}  threats={total}", color))
+            log(f"  → {rid}  score={report['score']}  grade={report['grade']}  threats={total}", color, quiet)
         except Exception as e:
-            print(c(f"  [!] Scan failed: {e}", C.RED))
+            log(f"  [!] Scan failed: {e}", C.RED, quiet)
 
         next_run = start + timedelta(hours=interval_hours)
-        print(c(f"  Next scan at {next_run:%Y-%m-%d %H:%M:%S}\n", C.DIM))
+        log(f"  Next scan at {next_run:%Y-%m-%d %H:%M:%S}\n", C.DIM, quiet)
         try:
             time.sleep(interval_hours * 3600)
         except KeyboardInterrupt:
-            print(c("\n[*] Stopped.", C.YELLOW))
+            log("\n[*] Stopped.", C.YELLOW, quiet)
             return 0
 
 
@@ -2417,12 +2529,15 @@ def main(argv=None):
         except argparse.ArgumentTypeError as e:
             print(c(f"[!] {e}", C.RED), file=sys.stderr)
             return 2
-        return headless_schedule(interval, args.scan, args.path, args.max_files)
+        return headless_schedule(
+            interval, args.scan, args.path, args.max_files, quiet=args.quiet,
+        )
 
     # Default: one-shot scan
-    print_banner()
+    if not args.quiet:
+        print_banner()
 
-    if not HAS_PSUTIL:
+    if not HAS_PSUTIL and not args.quiet:
         log("\n[i] psutil not installed — some checks will use fallbacks.", C.YELLOW)
         log("    Install for best results: pip install psutil", C.DIM)
 
@@ -2444,26 +2559,28 @@ def main(argv=None):
     score_color = C.GREEN if report["score"] >= 80 else C.YELLOW if report["score"] >= 60 else C.RED
     log(f"  Privacy score: {report['score']}/100  (grade {report['grade']})", score_color, args.quiet)
 
-    print_advice(report["advice"], quiet=False)
+    print_advice(report["advice"], quiet=args.quiet)
 
     if not args.no_history:
         try:
             rid = save_history(report)
-            log(f"\n[i] Saved to history: {rid}", C.DIM)
-            log(f"    View all: python snoop.py --history", C.DIM)
-            log(f"    Dashboard: python snoop.py --dashboard", C.DIM)
+            if not args.quiet:
+                log(f"\n[i] Saved to history: {rid}", C.DIM)
+                log(f"    View all: python snoop.py --history", C.DIM)
+                log(f"    Dashboard: python snoop.py --dashboard", C.DIM)
         except Exception as e:
-            log(f"\n[!] Could not save to history: {e}", C.RED)
+            log(f"\n[!] Could not save to history: {e}", C.RED, args.quiet)
 
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2, default=str)
-            log(f"[+] Report saved to {args.output}", C.GREEN)
+            log(f"[+] Report saved to {args.output}", C.GREEN, args.quiet)
         except OSError as e:
-            log(f"[!] Could not write report: {e}", C.RED)
+            log(f"[!] Could not write report: {e}", C.RED, args.quiet)
 
-    print()
+    if not args.quiet:
+        print()
     return 0
 
 
