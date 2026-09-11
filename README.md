@@ -121,13 +121,13 @@ Snoop looks at three areas: your system, your files, and your browsers.
 ### 1. Get the file
 
 ```bash
-curl -O https://raw.githubusercontent.com/YOURUSERNAME/snoop/main/snoop.py
+curl -O https://raw.githubusercontent.com/Heckerman-0/snoop/main/snoop.py
 ```
 
 Or clone the repo:
 
 ```bash
-git clone https://github.com/YOURUSERNAME/snoop.git
+git clone https://github.com/Heckerman-0/snoop.git
 cd snoop
 ```
 
@@ -455,7 +455,7 @@ PRs welcome on any of these.
 
 MIT License. See [LICENSE](LICENSE) for the full text.
 
-Copyright (c) 2026 Your Name
+Copyright (c) 2026 Heckerman-0
 
 ---
 
